@@ -1,0 +1,42 @@
+suite: backend serviceaccount + configmap
+templates:
+  - templates/backend/serviceaccount.yaml
+  - templates/backend/configmap.yaml
+release:
+  namespace: turbo
+tests:
+  - it: creates the turbo-app ServiceAccount (matches Pod Identity association)
+    template: templates/backend/serviceaccount.yaml
+    asserts:
+      - isKind:
+          of: ServiceAccount
+      - equal:
+          path: metadata.name
+          value: turbo-app
+  - it: names the backend ConfigMap turbo-app-config
+    template: templates/backend/configmap.yaml
+    asserts:
+      - isKind:
+          of: ConfigMap
+      - equal:
+          path: metadata.name
+          value: turbo-app-config
+  - it: carries non-secret config as string data
+    template: templates/backend/configmap.yaml
+    set:
+      backend.config:
+        ENVIRONMENT: production
+        OKTA_ISSUER: https://cargurus.okta.com/oauth2/default
+    asserts:
+      - equal:
+          path: data.ENVIRONMENT
+          value: "production"
+      - equal:
+          path: data.OKTA_ISSUER
+          value: "https://cargurus.okta.com/oauth2/default"
+  - it: sets PORT to 8080 so uvicorn binds the container port
+    template: templates/backend/configmap.yaml
+    asserts:
+      - equal:
+          path: data.PORT
+          value: "8080"
