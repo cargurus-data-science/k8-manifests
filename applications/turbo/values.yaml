@@ -1,0 +1,63 @@
+# Shared defaults. Per-environment values live in values-{dev,prod}.yaml.
+# REPLACE_ME_* markers are filled from Terraform outputs at install time.
+
+secrets:
+  coreName: turbo-core
+  externalToolsName: turbo-external-tools
+  arangoName: turbo-arango
+
+backend:
+  replicas: 1                              # PINNED — do not raise (spec §5)
+  image:
+    repository: REPLACE_ME_BACKEND_ECR_REPO   # modules/ecr (prod: turbo, dev: turbo-dev)
+    tag: REPLACE_ME_IMAGE_SHA                 # immutable SHA per deploy
+    pullPolicy: IfNotPresent
+  targetGroupArn: REPLACE_ME_BACKEND_TG_ARN   # modules/alb output
+  serviceAccountName: turbo-app
+  resources:
+    requests:
+      cpu: "2"
+      memory: 4Gi
+      ephemeral-storage: 20Gi               # repo clones + caches (spec §9.3, tunable)
+    limits:
+      memory: 4Gi
+      ephemeral-storage: 40Gi
+  # Non-secret env → ConfigMap turbo-app-config. Env-specific values are
+  # overridden/added in values-{env}.yaml.
+  config:
+    OAUTH_GHEC_ENABLED: "true"
+    OKTA_ISSUER: "https://cargurus.okta.com/oauth2/default"
+    TURBO_ASSISTANTS_DIR: "/app/assistants"
+    GHES_API_BASE_URL: "https://code.cargurus.com/api/v3"
+    GITHUB_REQUIRED_ORG: "cargurus-analytics"
+    GITHUB_ADMIN_LOGINS: '["rmankad","jhmorgan-cg"]'
+    OKTA_ADMIN_EMAILS: '["rmankad@cargurus.com","jhmorgan@cargurus.com"]'
+    DBT_CLOUD_IP_ALLOWLIST: "52.3.77.232,3.214.191.130,34.233.79.135"
+    HARNESS_PREWARM_REPOS: '["https://github.com/cargurus-analytics/dbt-central","https://github.com/cargurus-analytics/dbt-secure","https://github.com/cargurus-analytics/dbt-mrr","https://github.com/cargurus-analytics/dbt-fivetran-transformations","https://github.com/cargurus-analytics/dbt-iceberg","https://github.com/cargurus-analytics/cg-omni-curated","https://github.com/cargurus-analytics/cg-omni-restricted","https://github.com/cargurus-analytics/turbo","https://code.cargurus.com/analytics/migrator_analytics","https://code.cargurus.com/analytics/analytics-semantic-layer","https://github.com/cargurus-analytics/dbt-iceberg"]'
+    ARANGO_DATABASE: "turbo"
+    ARANGO_URL: ""                          # empty → backend skips ArangoDB gracefully
+    MEDIA_S3_BUCKET: REPLACE_ME_MEDIA_BUCKET  # modules/s3 output
+    # workflow-runner vars — ECS-specific, non-functional on EKS (spec §9.1).
+    # Carried so the app boots; workflow execution stays broken until the
+    # ecs:RunTask launcher is ported to the K8s Jobs API (out of scope).
+    ECS_CLUSTER_NAME: "turbo"
+    ECS_WORKFLOW_RUNNER_TASK_DEF: ""
+    ECS_WORKFLOW_RUNNER_CONTAINER_NAME: ""
+    ECS_WORKFLOW_RUNNER_SUBNETS: ""
+    ECS_WORKFLOW_RUNNER_SECURITY_GROUP: ""
+
+frontend:
+  replicas: 1
+  image:
+    repository: REPLACE_ME_FRONTEND_ECR_REPO  # prod: turbo-frontend, dev: turbo-frontend-dev
+    tag: REPLACE_ME_IMAGE_SHA
+    pullPolicy: IfNotPresent
+  targetGroupArn: REPLACE_ME_FRONTEND_TG_ARN
+  serviceAccountName: turbo-frontend
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      memory: 512Mi
+  config: {}                                # BACKEND_URL is templated (in-cluster DNS)
