@@ -1,0 +1,16 @@
+apiVersion: elbv2.k8s.aws/v1beta1
+kind: TargetGroupBinding
+metadata:
+  name: turbo-frontend
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "turbo.labels" . | nindent 4 }}
+    {{- include "turbo.frontend.selectorLabels" . | nindent 4 }}
+spec:
+  # target_type=ip: the LB Controller registers pod IPs directly into the
+  # Terraform-owned target group (spec §4.4 of the infra design).
+  targetType: ip
+  serviceRef:
+    name: turbo-frontend
+    port: 80
+  targetGroupARN: {{ .Values.frontend.targetGroupArn }}
