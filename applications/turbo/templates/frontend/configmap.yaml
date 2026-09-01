@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: turbo-frontend-config
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "turbo.labels" . | nindent 4 }}
+    {{- include "turbo.frontend.selectorLabels" . | nindent 4 }}
+data:
+  # server-only (server-api.ts). In-cluster DNS to the backend Service in
+  # THIS release's namespace — no ALB round-trip for server-side calls.
+  BACKEND_URL: "http://turbo-app.{{ .Release.Namespace }}.svc.cluster.local:8080"
+  PORT: "80"
+  {{- range $k, $v := .Values.frontend.config }}
+  {{ $k }}: {{ $v | quote }}
+  {{- end }}

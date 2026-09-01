@@ -1,0 +1,32 @@
+suite: frontend serviceaccount + configmap
+templates:
+  - templates/frontend/serviceaccount.yaml
+  - templates/frontend/configmap.yaml
+release:
+  namespace: turbo-dev
+tests:
+  - it: creates the turbo-frontend ServiceAccount
+    template: templates/frontend/serviceaccount.yaml
+    asserts:
+      - isKind:
+          of: ServiceAccount
+      - equal:
+          path: metadata.name
+          value: turbo-frontend
+  - it: points BACKEND_URL at the in-cluster backend Service in this namespace
+    template: templates/frontend/configmap.yaml
+    asserts:
+      - isKind:
+          of: ConfigMap
+      - equal:
+          path: metadata.name
+          value: turbo-frontend-config
+      - equal:
+          path: data.BACKEND_URL
+          value: http://turbo-app.turbo-dev.svc.cluster.local:8080
+  - it: pins the server port to 80
+    template: templates/frontend/configmap.yaml
+    asserts:
+      - equal:
+          path: data.PORT
+          value: "80"
