@@ -1,0 +1,65 @@
+suite: frontend deployment
+templates:
+  - templates/frontend/deployment.yaml
+release:
+  namespace: turbo
+tests:
+  - it: is a single-replica Deployment named turbo-frontend
+    asserts:
+      - isKind:
+          of: Deployment
+      - equal:
+          path: metadata.name
+          value: turbo-frontend
+      - equal:
+          path: spec.replicas
+          value: 1
+  - it: runs as the turbo-frontend ServiceAccount on port 80
+    asserts:
+      - equal:
+          path: spec.template.spec.serviceAccountName
+          value: turbo-frontend
+      - equal:
+          path: spec.template.spec.containers[0].ports[0].containerPort
+          value: 80
+  - it: reads env from the frontend configmap
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].envFrom
+          content:
+            configMapRef:
+              name: turbo-frontend-config
+  - it: probes / (Next.js has no dedicated health route)
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].livenessProbe.httpGet.path
+          value: /
+      - equal:
+          path: spec.template.spec.containers[0].readinessProbe.httpGet.path
+          value: /
+  - it: runs read-only-root non-root but keeps NET_BIND_SERVICE for port 80
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].securityContext.readOnlyRootFilesystem
+          value: true
+      - equal:
+          path: spec.template.spec.containers[0].securityContext.runAsUser
+          value: 1001
+      - contains:
+          path: spec.template.spec.containers[0].securityContext.capabilities.drop
+          content: ALL
+      - contains:
+          path: spec.template.spec.containers[0].securityContext.capabilities.add
+          content: NET_BIND_SERVICE
+  - it: provides writable scratch for a read-only rootfs
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: tmp
+            mountPath: /tmp
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: next-cache
+            mountPath: /app/.next/cache
