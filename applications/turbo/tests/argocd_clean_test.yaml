@@ -1,0 +1,33 @@
+suite: argocd-clean full render
+release:
+  namespace: turbo
+templates:
+  - templates/backend/deployment.yaml
+  - templates/frontend/deployment.yaml
+  - templates/backend/targetgroupbinding.yaml
+  - templates/frontend/targetgroupbinding.yaml
+tests:
+  - it: stamps the release namespace onto the backend Deployment
+    template: templates/backend/deployment.yaml
+    asserts:
+      - equal:
+          path: metadata.namespace
+          value: turbo
+  - it: stamps the release namespace onto the frontend Deployment
+    template: templates/frontend/deployment.yaml
+    asserts:
+      - equal:
+          path: metadata.namespace
+          value: turbo
+  - it: renders the backend TargetGroupBinding under the release namespace
+    template: templates/backend/targetgroupbinding.yaml
+    asserts:
+      - equal:
+          path: metadata.namespace
+          value: turbo
+  - it: renders the frontend TargetGroupBinding under the release namespace
+    template: templates/frontend/targetgroupbinding.yaml
+    asserts:
+      - equal:
+          path: metadata.namespace
+          value: turbo
