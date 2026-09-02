@@ -1,0 +1,172 @@
+# standup-socket — the Slack Socket Mode LISTENER (the @transmission mention path).
+#
+# A long-lived NON-SERVER workload. Layered over chart/values.yaml by:
+#
+#   helm upgrade --install standup-socket chart/ \
+#     --namespace transmission \
+#     --values chart/values/standup-socket-dev.yaml \
+#     --set image.tag=<sha> --wait --atomic
+#
+# Release name = service name = values stem = `standup-socket` — the convention
+# deploy.yml's matrix follows (deploy-convention-release-name-trap). ★ This name
+# MUST also be in deploy.yml's SERVICES array (the #317 miss: without it,
+# `helm upgrade --install` never runs and the Deployment is never created).
+#
+# ── WHY ITS OWN DEPLOYMENT (Architect-RULED 2026-07-26, Option A) ─────────────
+# `.dev/surface-socket-listener-deploy-shape.md`. Slack CANNOT reach us over HTTP:
+# mesh's ALB is `scheme: internal` and mesh.datasci.d-gurus.com is a PRIVATE DNS
+# zone (GitHub webhooks work through that host only because GHES is CG-internal;
+# Slack is public SaaS). So the mention path uses Socket Mode — an OUTBOUND
+# websocket this process dials to Slack. Something long-lived must hold it open.
+# The alternative — a background thread in the mesh API's boot — was REJECTED:
+#   * ONE deploy shape for background work in mesh (all 7 batch jobs are already
+#     separate Helm releases; a thread would be the sole in-process exception);
+#   * independent lifecycle — under the thread, EVERY mesh API restart (a deploy,
+#     a config change, an OOM kill) drops the Slack connection for no reason;
+#   * VISIBLE failure — a dead pod CrashLoopBackOffs and is alertable; a dead
+#     thread inside a healthy API pod is invisible: the pod stays green and
+#     mentions silently stop (the "confidently-wrong beats crashing" family);
+#   * mesh stays freely SCALABLE — an in-process socket would quietly make
+#     `replicas: 1` a CORRECTNESS constraint on the API (N replicas = N sockets =
+#     every mention answered N times), a nasty thing to bury in a values comment;
+#   * no boot-seam risk — services/mesh/app/main.py startup is the one place a bad
+#     addition breaks the API, the webhook front-door AND the trigger path.
+service:
+  # Resource handle (Deployment/SA/ConfigMap name). NOT a listen port.
+  name: standup-socket
+  # ★ NO LISTEN PORT. This process dials OUT to Slack; nothing connects to it, so
+  # it advertises no containerPort and gets no Service object. Declaring one would
+  # imply a service surface it doesn't have.
+  exposePort: false
+
+# ★ Override the image CMD. The mesh image's CMD is `fastapi run … app/main.py`;
+# this workload must run the LISTENER instead. Same image (it carries the shared
+# `mesh` library + scripts/), different entrypoint — exactly how the crons reuse it.
+command: ["python", "scripts/standup_socket.py"]
+
+# Reuse the mesh image: it already carries `mesh.standup` + scripts/ (the
+# Dockerfile builds from the repo root). CI pins the real SHA via --set image.tag.
+image:
+  repository: 457497801237.dkr.ecr.us-east-1.amazonaws.com/transmission/mesh
+  tag: 5e172d9b
+  pullPolicy: IfNotPresent
+
+# ONE replica, deliberately. Socket Mode opens one connection per process, and
+# Slack delivers each event to every connected socket — so N replicas would answer
+# every mention N times. Unlike the in-process option this is a LOCAL constraint on
+# a single-purpose Deployment (honest and contained), not a hidden correctness
+# constraint on the whole mesh API.
+replicas:
+  min: 1
+  max: 1
+hpa:
+  enabled: false
+
+# ── NO PROBES — this is the subtle one ───────────────────────────────────────
+# The chart's default probes are HTTP GETs against a listen port. This process has
+# NO HTTP server, so every probe would fail → CrashLoopBackOff on a perfectly
+# healthy listener. Liveness/readiness for a socket client would need a different
+# signal entirely (e.g. "is the wss connection established?"), which the chart has
+# no vocabulary for. Fail-closed startup is the substitute: scripts/standup_socket.py
+# exits NON-ZERO when SLACK_BOT_TOKEN / SLACK_SOCKET_TOKEN are unset, so a
+# misconfigured listener crash-loops LOUDLY rather than idling silently.
+probes:
+  liveness:
+    enabled: false
+  readiness:
+    enabled: false
+  startup:
+    enabled: false
+
+# Pod Identity: REUSE the mesh SA — its role already holds the AssumeRole chain
+# into transmission-recall-dev-app (the RW role the mirror + review-sweep use),
+# which is what the ask/standup projection reads need. No new IAM, no new
+# credential path.
+serviceAccount:
+  create: false
+  name: mesh
+
+# No ingress (nothing connects TO this) and no NetworkPolicy (the default-deny is
+# an INGRESS policy — moot for a workload with no listen port; its egress to Slack
+# / Recall / GHES is unrestricted, same as the services).
+ingress:
+  enabled: false
+networkPolicy:
+  enabled: false
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Config → ConfigMap. The listener needs: the Recall path (for the standup
+# projection + the channel-binding read) and the GitHub read config (the `merged`
+# PR-state enrichment). SLACK_BOT_TOKEN / SLACK_SOCKET_TOKEN + GH_PAT ride
+# mesh-secrets. The `ask` DISPATCHER now lands here (Phase B) and calls
+# make_model, which needs LITELLM_BASE_URL (the #445 class of gap: a missing base
+# URL makes the classifier raise and the loop silently never acts) —
+# LITELLM_API_KEY already rides mesh-secrets (envFromSecret below).
+# ─────────────────────────────────────────────────────────────────────────────
+env:
+  - name: ENVIRONMENT
+    value: dev
+
+  # Observability — same collector as the services.
+  - name: OTEL_EXPORTER_OTLP_ENDPOINT
+    value: http://otel-collector.observability:4318
+  - name: OTEL_SERVICE_NAME
+    value: standup-socket
+
+  # Model gateway — the `ask` Mode's classifier-tier call (mesh/shared/model.py,
+  # ChatOpenAI). Base URL is plain; LITELLM_API_KEY is in mesh-secrets.
+  - name: LITELLM_BASE_URL
+    value: https://litellm.datasci.d-gurus.com
+
+  # Recall path. The projection reads memory.run + memory.turn +
+  # memory.registered_channel over the mirror's pool (transmission_app).
+  # RECALL_USE_IAM=1 → the pool mints an RDS IAM token per connection;
+  # transmission-recall-dev-app `rds-db:connect`s ONLY as transmission_app.
+  - name: RECALL_USE_IAM
+    value: "true"
+  - name: RECALL_WRITE_ROLE
+    value: transmission_app
+  - name: RECALL_APP_ROLE_ARN
+    value: arn:aws:iam::457497801237:role/transmission-recall-dev-app
+
+  # ── Crate (e2b) — required by `query_snowflake` (#777) ────────────────────
+  # ★ Mirrors chart/values/mesh-dev.yaml:334-337. The Crate adapter
+  # (mesh/integrations/crate.py) reads E2B_DOMAIN / E2B_API_KEY; E2B_API_KEY is
+  # a credential and rides mesh-secrets, but E2B_DOMAIN is a plain HOSTNAME and
+  # belongs here — it is deliberately NOT a secret (mesh declares it the same
+  # way, and `E2B_DOMAIN in mesh-secrets` is False).
+  #
+  # ⚠ Why this was missing and why the symptom misled us: `ai-experiment`
+  # provisions Crate VMs from the `mesh` deployment, which has these. `swe-ask`
+  # runs in THIS process, which declared no E2B keys at all — so
+  # `query_snowflake` failed with "Crate sandbox requires E2B_DOMAIN" while
+  # Snowflake itself was fully configured. The agent then paraphrased a SANDBOX
+  # failure as "Snowflake isn't configured", sending a reader to chase warehouse
+  # access for a one-variable config gap. Same code, different pod env.
+  - name: SANDBOX_TYPE
+    value: crate
+  - name: E2B_DOMAIN
+    value: crate.datasci.d-gurus.com
+
+# mesh-secrets carries SLACK_BOT_TOKEN (post/reply), SLACK_SOCKET_TOKEN (the
+# xapp- app-level token the websocket authenticates with) and GH_PAT (the
+# read-scoped GHES PAT for the merged-PR enrichment).
+envFromSecret: mesh-secrets
+
+# ⚠ BUMP THIS ON EVERY ROTATION of mesh-secrets, in the same PR as the
+# rotation. `checksum/config` only hashes `.Values.env`; nothing hashes
+# `envFromSecret`, so rotating a key and running `helm upgrade` with
+# unchanged values renders a BYTE-IDENTICAL pod template and leaves the pod
+# on the OLD credential while `helm upgrade` exits 0. Any change to this
+# string works — it is hashed into a pod annotation, not parsed.
+secretVersion: "2026-08-12-initial"
+
+# A socket listener is very light — one persistent connection plus a couple of
+# reads per mention. No LLM, no sandbox, no embeddings.
+resources:
+  requests:
+    cpu: 50m
+    memory: 192Mi
+  limits:
+    cpu: 300m
+    memory: 512Mi

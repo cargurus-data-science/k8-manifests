@@ -1,0 +1,27 @@
+apiVersion: v2
+name: transmission
+description: >-
+  One parameterized Helm chart for every Transmission service (dashboard
+  backend + frontend, mesh, future webhook / MCP servers). Per-service-per-env
+  overrides live in chart/values/<service>-<env>.yaml — never N charts for N
+  services. See chart/README.md.
+type: application
+
+# Chart version: bump on template changes (chart structure).
+version: 0.1.0
+
+# appVersion is intentionally unset at chart level. Each service pins its own
+# image tag in its values file (image.tag); there is no single "app version"
+# across a multi-service chart. Helm defaults appVersion to the chart version
+# when unset, which is harmless — nothing in the templates reads .Chart.AppVersion.
+
+maintainers:
+  - name: Transmission platform
+    url: https://code.cargurus.com/cargurus-datasci/transmission
+
+# Single source of truth for the architecture this chart serves.
+home: https://code.cargurus.com/cargurus-datasci/transmission
+keywords:
+  - transmission
+  - mesh
+  - dashboard

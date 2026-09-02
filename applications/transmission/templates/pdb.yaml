@@ -1,0 +1,25 @@
+{{- /*
+PodDisruptionBudget. Skip it for effectively single-replica services: a
+minAvailable:1 PDB on one pod makes the budget unsatisfiable and blocks
+voluntary node drains (cluster upgrades, scale-down) indefinitely. A PDB only
+buys anything once there are ≥2 pods to protect.
+*/ -}}
+{{- $maxPods := ternary .Values.replicas.max .Values.replicas.min .Values.hpa.enabled -}}
+{{- if and .Values.pdb.enabled (gt (int $maxPods) 1) -}}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "transmission.name" . }}
+  namespace: {{ include "transmission.namespace" . }}
+  labels:
+    {{- include "transmission.labels" . | nindent 4 }}
+spec:
+  {{- if .Values.pdb.maxUnavailable }}
+  maxUnavailable: {{ .Values.pdb.maxUnavailable }}
+  {{- else }}
+  minAvailable: {{ .Values.pdb.minAvailable }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "transmission.selectorLabels" . | nindent 6 }}
+{{- end }}

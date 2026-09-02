@@ -1,0 +1,186 @@
+# semantic-author (AA-1 / S3) — the Lyra semantic-model authoring batch, in-cluster.
+#
+# A SCHEDULED BATCH job shape, but run ON-DEMAND (see the suspend gate below), not
+# a service. Layered over chart/values.yaml by:
+#
+#   helm upgrade --install semantic-author chart/ \
+#     --namespace transmission \
+#     --values chart/values/semantic-author-dev.yaml \
+#     --set image.tag=<sha> --wait --atomic
+#
+# Release name = service name = values stem = `semantic-author` — the convention
+# deploy.yml's matrix follows (deploy-convention-release-name-trap). ★ This name
+# MUST also be in deploy.yml's SERVICES array (the #317 miss: without it,
+# `helm upgrade --install` never runs and the CronJob object is never created).
+#
+# WHY THIS EXISTS (S3): scripts/author_semantic_models.py has only ever run from a
+# laptop, because the mesh IAM Recall pool needs boto3 (the `aws` extra) + the
+# LiteLLM gateway (the `flow` extra), and off-cluster that meant a hand-minted
+# `cg-power-user` RDS token (dev-aurora-migrate-apply-path). IN-CLUSTER the mesh SA
+# has Pod Identity into transmission-recall-dev-app, so RECALL_USE_IAM=true works
+# natively with NO token workaround — the same seam the dbt-refresh + review-sweep
+# crons already use. This wires the script as an in-cluster job so the S4 coverage
+# run (author drafts for every memory.dbt_model) runs under the SA, not a laptop.
+#
+# `cronjob.enabled: true` flips the ONE parameterized chart to render a `batch/v1`
+# CronJob and SUPPRESS the Deployment + Service (deployment.yaml / service.yaml
+# gate on it). It reuses the SAME cronjob.yaml template as learning-consolidation /
+# dbt-refresh / review-sweep — NO new chart, NO new template. It runs the SAME mesh
+# image (so `mesh.flow.semantic_author` + scripts/author_semantic_models.py are
+# present) but as a one-shot batch container that drafts + verifies + writes and exits.
+service:
+  # Resource handle (CronJob/SA/ConfigMap name). NOT a listen port — a job has no
+  # inbound traffic; `port` is unused here but the schema requires service.name.
+  name: semantic-author
+
+# Reuse the mesh image: it already carries the shared `mesh` library + scripts/
+# (Dockerfile builds from repo root), so scripts/author_semantic_models.py resolves
+# and `mesh.flow.semantic_author` imports. The image installs mesh[crate,aws,dcode,
+# flow] (services/mesh/pyproject.toml) — `aws` (boto3, the IAM RDS-token path) and
+# `flow` (langchain-openai for make_model, httpx for recall/embed, psycopg for the
+# mirror pool) are BOTH present, which is exactly this job's dependency closure. CI
+# pins the real SHA via --set image.tag.
+image:
+  repository: 457497801237.dkr.ecr.us-east-1.amazonaws.com/transmission/mesh
+  tag: 5e172d9b
+  pullPolicy: IfNotPresent
+
+# ─────────────────────────────────────────────────────────────────────────────
+# The job — an ADHOC / ON-DEMAND runner, NOT a frequent cron.
+#
+# ★ JUDGMENT CALL (S3): `--all` drafts + verifies + embeds for EVERY distinct
+# memory.dbt_model (~90 models today), each a sequential Lyra draft (sonnet) + a
+# grounded verifier (haiku) + a cohere-embed-v4 write — a ~1.5hr sequential pass.
+# That is an OCCASIONAL coverage run (a fresh dbt-refresh landed new models; a
+# prompt/verifier change warrants a re-draft), NOT every-6h hygiene. So this is
+# NOT scheduled to tick on its own:
+#
+#   * suspend: true         — the CronJob object is deployed PARKED (rendered,
+#                             image current, but the scheduler NEVER fires it).
+#                             This is the template's documented go-live gate
+#                             (cronjob.yaml suspend note) repurposed as the adhoc
+#                             switch: the object exists so it can be triggered by
+#                             hand, but no wall-clock tick ever runs it.
+#   * schedule: "0 0 1 1 *" — a SENTINEL (annually, 00:00 Jan 1). The template
+#                             REQUIRES a schedule (`required "cronjob.schedule…"`),
+#                             and this chart renders ONLY a CronJob (no bare
+#                             batch/v1 Job path), so a schedule must be present.
+#                             With suspend=true it is inert; the rare cadence means
+#                             even an ACCIDENTAL un-suspend fires at most once a
+#                             year, not a surprise ~1.5hr run every 6h. suspend is
+#                             the real guard; the schedule is a harmless placeholder.
+#
+# HOW THE COVERAGE RUN IS TRIGGERED (S4) — spawn a Job FROM the parked CronJob:
+#   kubectl -n transmission create job semantic-author-<yyyymmdd> \
+#     --from=cronjob/semantic-author
+# That copies this jobTemplate (image, SA, env, command, deadlines) and runs it
+# once, now — no un-suspend, no helm change. Watch: `kubectl -n transmission logs
+# -f job/semantic-author-<yyyymmdd>`. To draft a SUBSET instead of --all, override
+# the argv on the ad-hoc Job (`kubectl create job … --dry-run=client -o yaml`, edit
+# command to the unique_ids, apply) — the script accepts positional unique_ids.
+#
+# concurrencyPolicy=Forbid: never two coverage passes at once (they write the same
+# rows). restartPolicy=Never + backoffLimit=1: a failed pass surfaces as a Failed
+# Job (alertable), not an in-place retry loop; per-model draft failures are SKIPs
+# (logged, non-fatal — the script's exit-0 contract), so a non-zero exit means a
+# DB/connection/setup failure worth eyeballing.
+# activeDeadlineSeconds=7200 (2h): headroom over the ~1.5hr --all pass so a slow
+# gateway doesn't get the pass killed mid-corpus (the sibling crons use 1800/600
+# because they are seconds-to-minutes; this one is intrinsically long).
+# ─────────────────────────────────────────────────────────────────────────────
+cronjob:
+  enabled: true
+  suspend: true                  # PARKED — adhoc only; trigger via `kubectl create job --from=cronjob/semantic-author`
+  schedule: "0 0 1 1 *"          # sentinel (annually); inert while suspended — the template requires a schedule
+  timeZone: "UTC"
+  command: ["python", "scripts/author_semantic_models.py", "--all"]
+  concurrencyPolicy: Forbid
+  restartPolicy: Never
+  backoffLimit: 1
+  activeDeadlineSeconds: 7200     # 2h — headroom over the ~1.5hr sequential --all pass
+
+# Pod Identity: REUSE the mesh SA — its role (transmission-dev-mesh) already holds
+# AssumeRole+TagSession+SetSourceIdentity into transmission-recall-dev-app (the RW
+# role, verified live for the conversation-mirror write path), which is exactly the
+# credential the draft-write (status='draft', source='lyra:auto') needs. Both the
+# RecallDbtRowReader (reads memory.dbt_model) and the RecallSemanticModelWriter
+# (writes memory.semantic_model) use the SAME mirror pool builder as transmission_app
+# (mesh.mirror.db.build_pool). No new IAM, no new credential path — the authoring
+# write reuses the M1 mirror's RW discipline (same as dbt-refresh / review-sweep).
+serviceAccount:
+  create: false
+  name: mesh
+
+# No autoscaler / no PDB / no ingress — a batch job has none of these.
+hpa:
+  enabled: false
+ingress:
+  enabled: false
+# A CronJob has no listen port, so the default-deny *ingress* NetworkPolicy is
+# moot; skip it (egress to Recall/STS/LiteLLM is unrestricted, same as services).
+networkPolicy:
+  enabled: false
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Config → ConfigMap. The job needs: the RW Recall path (transmission_app, IAM)
+# for the read (memory.dbt_model) + the draft write (memory.semantic_model), and
+# the LiteLLM gateway for ALL THREE model touches — the Lyra draft (make_model()
+# default llm_model_id=claude-sonnet-4-6), the grounded verifier (JUDGE_MODEL
+# claude-haiku-4-5), and the ai_context embed (cohere-embed-v4 via mesh.recall.embed).
+# NO warehouse creds, NO sandbox: the script reads dbt metadata already in Recall,
+# never Snowflake, and spins no Crate sandbox (so no E2B_* here, unlike review-sweep).
+# ─────────────────────────────────────────────────────────────────────────────
+env:
+  - name: ENVIRONMENT
+    value: dev
+
+  # Observability — same collector as the services.
+  - name: OTEL_EXPORTER_OTLP_ENDPOINT
+    value: http://otel-collector.observability:4318
+  - name: OTEL_SERVICE_NAME
+    value: semantic-author
+
+  # Model gateway — the Lyra draft + verifier + embed all route through the CG
+  # LiteLLM gateway (make_model / mesh.recall.embed both read LITELLM_BASE_URL +
+  # LITELLM_API_KEY). Base URL is plain; LITELLM_API_KEY is in the mesh-secrets
+  # Secret. Without LITELLM_BASE_URL make_model raises "Missing required env
+  # var(s)" and the batch fails before any write. Same gateway as mesh-dev /
+  # learning-consolidation-dev.
+  - name: LITELLM_BASE_URL
+    value: https://litellm.datasci.d-gurus.com
+  # The Lyra DRAFTER model (make_model() with no override → settings.llm_model_id).
+  # Set explicitly for legibility in `kubectl get cm`; equals the code default, so
+  # no behavior change. The verifier pins claude-haiku-4-5 in code (JUDGE_MODEL);
+  # the embed pins cohere-embed-v4 in code (EMBED_MODEL) — neither reads this.
+  - name: LLM_MODEL_ID
+    value: claude-sonnet-4-6
+
+  # Recall RW path. Both the memory.dbt_model READ and the memory.semantic_model
+  # draft WRITE run as transmission_app over the mirror's pool builder
+  # (mesh.mirror.db, RECALL_WRITE_ROLE). RECALL_USE_IAM=1 → the pool mints an RDS
+  # IAM token per connection; transmission-recall-dev-app `rds-db:connect`s ONLY as
+  # transmission_app (the strict role↔DB-user pairing). No DB password / secret
+  # needed under IAM. RECALL_HOST / RECALL_DATABASE are NOT set here — MirrorSettings
+  # already defaults them to dev Aurora (transmission-recall-dev / transmission_recall),
+  # exactly as dbt-refresh-dev + review-sweep-dev + learning-consolidation-dev rely on.
+  - name: RECALL_USE_IAM
+    value: "true"
+  - name: RECALL_WRITE_ROLE
+    value: transmission_app
+  - name: RECALL_APP_ROLE_ARN
+    value: arn:aws:iam::457497801237:role/transmission-recall-dev-app
+
+# LITELLM_API_KEY (the gateway virtual key) lives in the mesh-secrets Secret —
+# the same Secret the mesh service uses; reused here for the draft + verify + embed.
+envFromSecret: mesh-secrets
+
+# A per-model pass is light on CPU/memory (a few SELECTs, gateway round-trips, and
+# a handful of UPSERTs) — the length comes from SEQUENCE, not intensity. Same floor
+# as the sibling crons; the 2h activeDeadlineSeconds is what accommodates the length.
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi

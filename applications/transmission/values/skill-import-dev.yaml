@@ -1,0 +1,116 @@
+# SkillImportJob (Skills S1) — the skill-index sync CronJob.
+#
+# A SCHEDULED BATCH job, not a service. Layered over chart/values.yaml by:
+#
+#   helm upgrade --install skill-import chart/ \
+#     --namespace transmission \
+#     --values chart/values/skill-import-dev.yaml \
+#     --set image.tag=<sha> --wait --atomic
+#
+# Release name = service name = values stem = `skill-import` — the convention
+# deploy.yml's matrix follows (deploy-convention-release-name-trap).
+#
+# `cronjob.enabled: true` flips the ONE parameterized chart to render a
+# `batch/v1` CronJob and SUPPRESS the Deployment + Service (deployment.yaml /
+# service.yaml gate on it). It reuses the SAME cronjob.yaml template as the
+# learning-consolidation job — NO new chart, NO new cronjob template. It runs the
+# SAME mesh image (so `mesh.flow.skill_import` + scripts/ are present) but as a
+# one-shot batch container that runs the pass and exits.
+service:
+  # Resource handle (CronJob/SA/ConfigMap name). NOT a listen port — a job has no
+  # inbound traffic; `port` is unused here but the schema requires service.name.
+  name: skill-import
+
+# Reuse the mesh image: it already carries the shared `mesh` library + scripts/
+# (Dockerfile builds from repo root), so scripts/import_skills.py resolves and
+# `mesh.flow.skill_import` imports. CI pins the real SHA via --set image.tag.
+image:
+  repository: 457497801237.dkr.ecr.us-east-1.amazonaws.com/transmission/mesh
+  tag: 5e172d9b
+  pullPolicy: IfNotPresent
+
+# ─────────────────────────────────────────────────────────────────────────────
+# The cron itself. Skills drift slowly (a new skill is a merged PR), so a daily
+# sync is ample — 06:00 UTC. Forbid overlap; a failed pass becomes a Failed Job
+# (alertable) and the next tick retries (the index is untouched on failure).
+# restartPolicy=Never + backoffLimit=1: don't hammer in place.
+# ─────────────────────────────────────────────────────────────────────────────
+cronjob:
+  enabled: true
+  schedule: "0 6 * * *"          # daily at 06:00
+  timeZone: "UTC"
+  command: ["python", "scripts/import_skills.py"]
+  concurrencyPolicy: Forbid
+  restartPolicy: Never
+  backoffLimit: 1
+  activeDeadlineSeconds: 1800
+
+# Pod Identity: REUSE the mesh SA — its role (transmission-dev-mesh) already holds
+# AssumeRole+TagSession+SetSourceIdentity into transmission-recall-dev-app (the RW
+# role), which is exactly the credential the skill UPSERT needs. No new IAM, no new
+# credential path — the importer's write reuses the consolidation/promote RW
+# discipline; the source reads use the same GH_PAT the mesh service already holds.
+serviceAccount:
+  create: false
+  name: mesh
+
+# No autoscaler / no PDB / no ingress — a batch job has none of these.
+hpa:
+  enabled: false
+ingress:
+  enabled: false
+# A CronJob has no listen port, so the default-deny *ingress* NetworkPolicy is
+# moot; skip it (egress to Recall/GitHub/STS is unrestricted, same as services).
+networkPolicy:
+  enabled: false
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Config → ConfigMap. The job needs: the RW Recall path (transmission_app, IAM)
+# for the UPSERT, and the GHES READ path (GH_PAT + the API/clone hosts) to read
+# the source repos read-only. NO LiteLLM — the importer makes no LLM call (unlike
+# the consolidation job's contradiction check).
+# ─────────────────────────────────────────────────────────────────────────────
+env:
+  - name: ENVIRONMENT
+    value: dev
+
+  # Observability — same collector as the services.
+  - name: OTEL_EXPORTER_OTLP_ENDPOINT
+    value: http://otel-collector.observability:4318
+  - name: OTEL_SERVICE_NAME
+    value: skill-import
+
+  # GHES read path (read-only source reads via GitHubRestReader). GH_PAT (the
+  # read-scoped PAT) lives in the mesh-secrets Secret — the SAME read PAT the mesh
+  # service + the checkout path use. BROKER_GITHUB_READS stays off (default): the
+  # static read PAT, byte-identical to the checkout path, until the GitHub App is
+  # registered.
+  - name: GITHUB_API_URL
+    value: https://code.cargurus.com/api/v3
+  - name: GITHUB_CLONE_HOST
+    value: code.cargurus.com
+
+  # Recall RW path. The UPSERT + mark-removed UPDATEs run as transmission_app over
+  # the mirror's pool builder (mesh.mirror.db, RECALL_WRITE_ROLE). RECALL_USE_IAM=1
+  # → the pool mints an RDS IAM token per connection; transmission-recall-dev-app
+  # `rds-db:connect`s ONLY as transmission_app (the strict role↔DB-user pairing).
+  # No DB password / secret needed under IAM.
+  - name: RECALL_USE_IAM
+    value: "true"
+  - name: RECALL_WRITE_ROLE
+    value: transmission_app
+  - name: RECALL_APP_ROLE_ARN
+    value: arn:aws:iam::457497801237:role/transmission-recall-dev-app
+
+# GH_PAT (the read-scoped GHES PAT) lives in the mesh-secrets Secret — the same
+# Secret the mesh service uses; reused here for the read-only source reads.
+envFromSecret: mesh-secrets
+
+# A batch pass is light (a few GitHub GETs + a handful of UPSERTs).
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi

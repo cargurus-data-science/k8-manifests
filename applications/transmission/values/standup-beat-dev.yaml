@@ -1,0 +1,128 @@
+# standup-beat — the daily SWE standup "Beat" (@transmission read-side voice).
+#
+# A SCHEDULED BATCH job, not a service. Layered over chart/values.yaml by:
+#
+#   helm upgrade --install standup-beat chart/ \
+#     --namespace transmission \
+#     --values chart/values/standup-beat-dev.yaml \
+#     --set image.tag=<sha> --wait --atomic
+#
+# Release name = service name = values stem = `standup-beat` — the convention
+# deploy.yml's matrix follows (deploy-convention-release-name-trap). ★ This name
+# MUST also be in deploy.yml's SERVICES array (the #317 miss: without it,
+# `helm upgrade --install` never runs for the cron and the CronJob object is
+# never created in-cluster). It IS added there in this PR.
+#
+# `cronjob.enabled: true` flips the chart to render a `batch/v1` CronJob and
+# SUPPRESS the Deployment + Service (deployment.yaml / service.yaml gate on it).
+# It runs the SAME mesh image (so `mesh.standup` + scripts/ are present) but as a
+# one-shot batch container that builds + posts the standup and exits.
+#
+# READ-ONLY + one Slack post (propose-tier, @transmission "is not a Domain"):
+# reads memory.run + the persisted open_pr turn (the mesh-side read-projection),
+# derives PR state (draft/open from the turn, merged from the existing GitHub
+# reader), renders Block Kit, and posts to STANDUP_SLACK_CHANNEL. No run, no
+# harness, no sandbox, no gate — so NO LiteLLM gateway + NO Crate sandbox config
+# (unlike review-sweep, which dispatches Modes).
+service:
+  # Resource handle (CronJob/SA/ConfigMap name). NOT a listen port — a job has no
+  # inbound traffic; `port` is unused here but the schema requires service.name.
+  name: standup-beat
+
+# Reuse the mesh image: it already carries the shared `mesh` library + scripts/
+# (Dockerfile builds from repo root), so scripts/standup_beat.py resolves and
+# `mesh.standup` imports. CI pins the real SHA via --set image.tag.
+image:
+  repository: 457497801237.dkr.ecr.us-east-1.amazonaws.com/transmission/mesh
+  tag: 5e172d9b
+  pullPolicy: IfNotPresent
+
+# ─────────────────────────────────────────────────────────────────────────────
+# The cron itself — daily on weekdays at 09:00 ET (13:00 UTC). A standup is a
+# once-a-morning Beat, unlike the review sweep's */15 detection tick.
+# concurrencyPolicy=Forbid: never two overlapping posts. restartPolicy=Never +
+# backoffLimit=1: a failed post becomes a Failed Job (alertable); the next day retries.
+# ─────────────────────────────────────────────────────────────────────────────
+cronjob:
+  enabled: true
+  suspend: false
+  schedule: "0 13 * * 1-5"        # weekdays 09:00 ET (13:00 UTC)
+  timeZone: "UTC"
+  command: ["python", "scripts/standup_beat.py"]
+  concurrencyPolicy: Forbid
+  restartPolicy: Never
+  backoffLimit: 1
+  activeDeadlineSeconds: 300      # a read-projection + one Slack post
+
+# Pod Identity: REUSE the mesh SA — its role (transmission-dev-mesh) already holds
+# AssumeRole+TagSession+SetSourceIdentity into transmission-recall-dev-app (the RW
+# role, used by the mirror + review-sweep), which is exactly what the read pool
+# needs. No new IAM, no new credential path — the beat reuses the mirror's pool.
+serviceAccount:
+  create: false
+  name: mesh
+
+# No autoscaler / no PDB / no ingress — a batch job has none of these.
+hpa:
+  enabled: false
+ingress:
+  enabled: false
+networkPolicy:
+  enabled: false
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Config → ConfigMap. The job needs: the Recall path (transmission_app, IAM) for
+# the memory.run + open_pr-turn read, the GitHub read config (GH_PAT rides the
+# Secret) for the `merged` enrichment, and STANDUP_SLACK_CHANNEL (the dev channel;
+# the flip to #data-science is this one-line values change, not code). NO LiteLLM,
+# NO Crate — this job runs no Mode/sandbox/model (unlike review-sweep).
+# ─────────────────────────────────────────────────────────────────────────────
+env:
+  - name: ENVIRONMENT
+    value: dev
+
+  # Observability — same collector as the services.
+  - name: OTEL_EXPORTER_OTLP_ENDPOINT
+    value: http://otel-collector.observability:4318
+  - name: OTEL_SERVICE_NAME
+    value: standup-beat
+
+  # The dev channel (Raghu-ruled default). Flip to #data-science by editing THIS
+  # value + helm upgrade — never in code (same pattern as pilot_review_repos).
+  #
+  # ★ Now the FALLBACK, not the primary destination (#561/#562). The Beat posts to
+  # every active broadcast binding in memory.registered_channel (bound by an admin
+  # via Integrations → "Set broadcast channel"); this value is used only when that
+  # table has NO active broadcast rows, or the binding read itself fails. Keep it
+  # set — it is what a fresh/empty dev deploy posts to.
+  - name: STANDUP_SLACK_CHANNEL
+    value: "#raghu-test"
+
+  # Recall read path. The projection reads memory.run + memory.turn over the
+  # mirror's pool (transmission_app). RECALL_USE_IAM=1 → the pool mints an RDS IAM
+  # token per connection; transmission-recall-dev-app `rds-db:connect`s ONLY as
+  # transmission_app (the strict role↔DB-user pairing). No DB password needed.
+  - name: RECALL_USE_IAM
+    value: "true"
+  - name: RECALL_WRITE_ROLE
+    value: transmission_app
+  - name: RECALL_APP_ROLE_ARN
+    value: arn:aws:iam::457497801237:role/transmission-recall-dev-app
+
+# mesh-secrets carries what this beat needs (same Secret the mesh service + the
+# review sweep use): GH_PAT (the read-scoped GHES PAT for the `merged`
+# enrichment) and SLACK_BOT_TOKEN (the bot token the single chat.postMessage
+# uses). SLACK_SIGNING_SECRET is only needed by the inbound events route (the mesh
+# service), not this outbound-only beat. ★ AM provisions SLACK_BOT_TOKEN into
+# mesh-secrets post-merge (references it by env name only here).
+envFromSecret: mesh-secrets
+
+# A standup beat is very light (a couple of reads + one Slack post — no LLM, no
+# embeddings, no sandbox).
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi

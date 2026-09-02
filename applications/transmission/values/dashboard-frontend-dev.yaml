@@ -1,0 +1,97 @@
+# Dashboard frontend — dev environment values.
+#
+# Layered over chart/values.yaml by:
+#   helm upgrade --install dashboard-frontend chart/ \
+#     --values chart/values/dashboard-frontend-dev.yaml
+#
+# nginx serving a static Vite bundle. Shares the dashboard ALB with the backend.
+service:
+  name: dashboard-frontend
+  port: 80
+
+image:
+  repository: 457497801237.dkr.ecr.us-east-1.amazonaws.com/transmission/dashboard-frontend
+  tag: 0590738a
+  pullPolicy: IfNotPresent
+
+# Static assets: one replica, no autoscaling. With hpa disabled the Deployment is
+# pinned to replicas.min, and the PDB auto-skips (a 1-pod PDB blocks node drains).
+replicas:
+  min: 1
+  max: 1
+hpa:
+  enabled: false
+
+# The frontend reaches the backend purely over the public ALB (same hostname,
+# /api), and external-dns needs an owner for the shared A-record, so the FE also
+# carries an Ingress in the SAME ALB group. Catch-all "/" is matched AFTER the
+# backend's /api (higher groupOrder = lower precedence).
+serviceAccount:
+  # No AWS calls from nginx, but Pod Identity still wants a named SA per pod.
+  create: true
+  name: dashboard-fe
+
+ingress:
+  enabled: true
+  hostname: turbo.datasci.d-gurus.com
+  path: /
+  groupName: transmission-dashboard
+  groupOrder: 20
+  # healthcheckPath defaults to path ("/"), which nginx serves 200 — correct here.
+  # MUST equal the backend's certificateArn (shared ALB group — see backend
+  # values). Existing *.datasci.d-gurus.com wildcard, reused by DS-2798.
+  certificateArn: "arn:aws:acm:us-east-1:457497801237:certificate/4e3c9e91-1ac4-4ec2-a4f0-f007b72cd25e"
+
+# Probes hit nginx on :80 at "/" (index.html). The backend's /api/health paths
+# don't apply to the static server.
+probes:
+  liveness:
+    path: /
+  readiness:
+    path: /
+  startup:
+    path: /
+
+# Build-time only — baked into the static bundle by the Dockerfile's
+# `ARG VITE_API_URL`. NOT a runtime env var and NOT consumed by the chart; the
+# deploy workflow passes it to `docker build`. Kept here as the single source of
+# truth for what the image was built against.
+buildArgs:
+  VITE_API_URL: https://turbo.datasci.d-gurus.com
+
+# Stock nginx:1 runs its master as root. The chart default drops ALL Linux
+# caps, which CrashLoops nginx at startup. Keep least-privilege (drop ALL) but
+# add back exactly the caps the root master needs to boot:
+#   NET_BIND_SERVICE — bind the privileged :80 listen socket
+#   CHOWN            — chown /var/cache/nginx/*_temp to the worker user (101)
+#   SETUID, SETGID   — fork workers and drop them to that unprivileged user
+# (An earlier version added only NET_BIND_SERVICE and CrashLooped on
+# `chown(... ,101) failed (Operation not permitted)` — the bind isn't the only
+# thing the root master does. This is the minimal complete set.) Hardening to a
+# non-root nginx image on a high port is a tracked follow-up; this override then
+# goes away.
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+    add:
+      - NET_BIND_SERVICE
+      - CHOWN
+      - SETUID
+      - SETGID
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    cpu: 200m
+    memory: 128Mi
+
+networkPolicy:
+  enabled: true
+  allowFromNamespaces:
+    - transmission
+    - kube-system
+  allowFromCIDRs: []

@@ -1,0 +1,186 @@
+# Edge backend — the code-running AG-UI agent — dev environment values.
+#
+# Layered over chart/values.yaml by:
+#   helm upgrade --install edge-backend chart/ \
+#     --namespace transmission \
+#     --values chart/values/edge-backend-dev.yaml \
+#     --set image.tag=<sha> --wait --atomic
+#
+# DEPLOY CONVENTION (deploy.yml header; deploy-convention-release-name trap):
+# the Helm release name == service.name == this file's stem == `edge-backend`.
+# This file is scaffolded but DELIBERATELY NOT wired into the deploy.yml services
+# matrix in this PR (PR-2 is non-deploying; PR-3 does the deploy wiring). Until
+# then this service does not deploy.
+#
+# Modeled on chart/values/edge-frontend-dev.yaml (sibling Edge service) and
+# chart/values/mesh-dev.yaml (the env/secret + OTel pattern). Edge backend
+# imports NO mesh code (edge-boundary.md rule 3); it mirrors the deploy shape.
+service:
+  name: edge-backend
+  port: 8002
+
+image:
+  repository: 457497801237.dkr.ecr.us-east-1.amazonaws.com/transmission/edge-backend
+  # Default tag; the real install pins the built image SHA via `--set image.tag=<sha>`.
+  tag: cbbd2429
+  pullPolicy: IfNotPresent
+
+# One replica, no autoscaling. The AG-UI/LangGraph run uses an in-process
+# InMemorySaver checkpointer and a per-run e2b sandbox, so there is no
+# cross-replica state to coordinate for the thin slice. PDB auto-skips at 1 pod.
+replicas:
+  min: 1
+  max: 1
+hpa:
+  enabled: false
+
+# Pod Identity wants a named SA per pod. NOTE: the production sandbox-auth story
+# for Edge is TBD (flagged to the core Architect) — for now the e2b dev API key
+# is injected via the Secret below, not minted via this SA. No AWS calls today.
+serviceAccount:
+  create: true
+  name: edge-be
+
+# PR-3 deploy wiring: Edge gets its OWN shared ALB group `transmission-edge` on
+# its OWN hostname `edge.datasci.d-gurus.com` (NOT the dashboard's host/group).
+# Backend owns the /agent prefix; lower groupOrder (10) => its rule is matched
+# before the frontend's catch-all "/" (groupOrder 20). Mirrors the dashboard
+# two-service shared-ALB pattern (chart/values/dashboard-backend-dev.yaml).
+ingress:
+  enabled: true
+  hostname: edge.datasci.d-gurus.com
+  path: /agent
+  groupName: transmission-edge
+  groupOrder: 10
+  # ALB (target-type=ip) health-checks pods directly. /agent is POST-only (the
+  # AG-UI SSE endpoint), so a GET healthcheck against it would fail — point the
+  # check at /healthz, a plain 200 liveness route (app/main.py).
+  healthcheckPath: /healthz
+  # NO certificateArn: the dashboard's wildcard cert is *.datasci.d-gurus.com
+  # which DOES cover edge.datasci.d-gurus.com — but reusing a cert across a
+  # DIFFERENT ALB group is not required, and this PR avoids hard-coding a cert
+  # decision for a host whose ALB group is new. Omitting it makes the Edge ALB
+  # HTTP-only (template else-branch: listen-ports [{"HTTP":80}]). PREREQUISITE:
+  # an ACM cert valid for edge.datasci.d-gurus.com (the *.datasci.d-gurus.com
+  # wildcard at arn:aws:acm:us-east-1:457497801237:certificate/4e3c9e91-1ac4-4ec2-a4f0-f007b72cd25e
+  # covers this host and may be reused on this group's first HTTPS cut) — set it
+  # here to flip to HTTPS + 80->443 redirect. Surfaced via Raghu (DS-2798 lane).
+
+# Health endpoints (app/main.py): /healthz (liveness) + /readyz (readiness).
+# /readyz returns 200 whenever the service is serving and annotates the body
+# with the run-path snapshot (a missing LITELLM_*/E2B_API_KEY is visible without
+# flapping the gate). No /startup — reuse /healthz.
+probes:
+  liveness:
+    path: /healthz
+  readiness:
+    path: /readyz
+  startup:
+    path: /healthz
+
+# Plain (non-secret) config -> ConfigMap. Sensitive values live in the
+# `edge-backend-secrets` Secret (envFromSecret, below).
+env:
+  - name: ENVIRONMENT
+    value: dev
+
+  # Observability — service owns the OTel provider; spans fan out to the
+  # collector in the observability namespace. service.name=edge-backend.
+  - name: OTEL_EXPORTER_OTLP_ENDPOINT
+    value: http://otel-collector.observability:4318
+  - name: OTEL_SERVICE_NAME
+    value: edge-backend
+
+  # Model gateway — base URL is plain; LITELLM_API_KEY is in the Secret. Every
+  # model call routes through the CG LiteLLM gateway (gateway-or-bust).
+  - name: LITELLM_BASE_URL
+    value: https://litellm.datasci.d-gurus.com
+  - name: LLM_MODEL_ID
+    value: claude-sonnet-4-6
+
+  # Sandbox — e2b used DIRECTLY (NOT the Crate adapter). Domain is plain;
+  # E2B_API_KEY is in the Secret. Compute-only; no external writes leave it.
+  - name: E2B_DOMAIN
+    value: crate.datasci.d-gurus.com
+
+  # Sandbox python launcher. The CG Crate default template (Debian 12) ships
+  # python3 + pip but NOT uv and NOT pandas (verified live against the cluster),
+  # so the in-code default (`uv run --with pandas python3`) fails with
+  # `uv: command not found`. Install pandas with pip, then run the cell.
+  # `sandbox.py` composes `{launcher} {script}`, so this must end ready to take
+  # the script path as the next arg — `…; python3` does exactly that.
+  # (If/when a Crate template bakes pandas, drop this and use a bare `python3`.)
+  - name: EDGE_PY_LAUNCHER
+    value: "pip install -q pandas >/dev/null 2>&1; python3"
+
+  # Full e2b slice (NOT the checkpoint-1 hello graph). The first deployable cut
+  # (PR-3) shipped hello-mode TRUE to prove the ALB/ingress/pod path with zero
+  # creds; the `edge-backend-secrets` Secret (LITELLM_API_KEY, E2B_API_KEY) is now
+  # seeded, so this serves the real graph — a chat runs Python in a live e2b
+  # sandbox and returns a real df.head() dataframe. (Verified on-cluster.)
+  - name: EDGE_HELLO_MODE
+    value: "false"
+
+  # CORS: the deployed frontend origin (filled in at PR-3 when the ingress
+  # hostname is known). Defaults in code cover local vite dev.
+  - name: EDGE_CORS_ORIGINS
+    value: https://edge.datasci.d-gurus.com
+
+# Sensitive run-path creds, populated out-of-band into the `edge-backend-secrets`
+# Secret (External Secrets productionizes it later). Keys injected via envFrom:
+#   - LITELLM_API_KEY  virtual key for the LiteLLM gateway
+#   - E2B_API_KEY      e2b API key for the compute-only sandbox (dev key for now;
+#                      the production sandbox-auth story for Edge is TBD —
+#                      flagged to the core Architect, may want the broker later)
+#
+# Snowflake data source (the demo path — key-pair, read-only, SERVER-SIDE only;
+# the credential NEVER enters the e2b sandbox or the agent loop). Sourced from
+# the existing AWS Secrets Manager secret `snowflake/rmulukutla` into the SAME
+# `edge-backend-secrets` Secret (do NOT hardcode/commit any value here):
+#   - SNOWFLAKE_USER         Snowflake user
+#   - SNOWFLAKE_ACCOUNT      Snowflake account locator
+#   - SNOWFLAKE_PRIVATE_KEY  PEM-encoded RSA key (key-pair; preferred over pwd) —
+#                            CROWN-JEWEL value, never logged (logging.py pins the
+#                            snowflake/cryptography loggers to WARNING)
+#   - SNOWFLAKE_PASSWORD     password fallback (used only if no private key)
+#   - SNOWFLAKE_ROLE         session role
+#   - SNOWFLAKE_WAREHOUSE    the cost/compute bound for queries
+#   - SNOWFLAKE_DATABASE     default database for the session
+# Optional knob (plain, not secret): SNOWFLAKE_MAX_ROWS (row cap, default 500).
+#
+# ⚠️ DEMO SHORTCUT: `snowflake/rmulukutla` is Raghu's PERSONAL login → every Edge
+# user queries AS Raghu (his grants). Fine for the demo Raghu drives; NOT for
+# real users (OWASP-LLM06 excessive-permissions). The real-user fix is the
+# per-user broker (feat/broker-snowflake-arm / DS-2846, GO, post-demo).
+#
+# When NONE of the SNOWFLAKE_* keys are set the backend keeps the committed
+# sample.csv path (the source is gated by config — see app/graph.build_graph).
+#
+# Seed placeholders so the pod starts health-first and a *run* fails loudly at
+# the model/sandbox call until the real values land — no silent drop.
+envFromSecret: edge-backend-secrets
+
+# ⚠ BUMP THIS ON EVERY ROTATION of edge-backend-secrets, in the same PR as
+# the rotation. `checksum/config` only hashes `.Values.env`; nothing hashes
+# `envFromSecret`, so rotating a key and running `helm upgrade` with
+# unchanged values renders a BYTE-IDENTICAL pod template and leaves the pod
+# on the OLD credential while `helm upgrade` exits 0. Any change to this
+# string works — it is hashed into a pod annotation, not parsed.
+secretVersion: "2026-08-12-initial"
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 512Mi
+  limits:
+    cpu: "1"
+    memory: 1Gi
+
+# Default-deny ingress; intra-cluster callers live in `transmission`. The Edge
+# frontend reaches this over the ALB (PR-3) and/or cluster DNS.
+networkPolicy:
+  enabled: true
+  allowFromNamespaces:
+    - transmission
+    - kube-system
+  allowFromCIDRs: []

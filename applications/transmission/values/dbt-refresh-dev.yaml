@@ -1,0 +1,141 @@
+# dbt-refresh (B2a PR-4) — the nightly dbt-model ingest CronJob.
+#
+# A SCHEDULED BATCH job, not a service. Layered over chart/values.yaml by:
+#
+#   helm upgrade --install dbt-refresh chart/ \
+#     --namespace transmission \
+#     --values chart/values/dbt-refresh-dev.yaml \
+#     --set image.tag=<sha> --wait --atomic
+#
+# Release name = service name = values stem = `dbt-refresh` — the convention
+# deploy.yml's matrix follows (deploy-convention-release-name-trap).
+#
+# `cronjob.enabled: true` flips the ONE parameterized chart to render a
+# `batch/v1` CronJob and SUPPRESS the Deployment + Service (deployment.yaml /
+# service.yaml gate on it). It reuses the SAME cronjob.yaml template as the
+# skill-import / learning-consolidation jobs — NO new chart, NO new cronjob
+# template. It runs the SAME mesh image (so `mesh.flow.dbt_ingest` +
+# scripts/refresh_dbt_models.py are present) but as a one-shot batch container
+# that reads the manifest, upserts memory.dbt_model, and exits.
+service:
+  # Resource handle (CronJob/SA/ConfigMap name). NOT a listen port — a job has no
+  # inbound traffic; `port` is unused here but the schema requires service.name.
+  name: dbt-refresh
+
+# Reuse the mesh image: it already carries the shared `mesh` library + scripts/
+# (Dockerfile builds from repo root), so scripts/refresh_dbt_models.py resolves
+# and `mesh.flow.dbt_ingest` imports. CI pins the real SHA via --set image.tag.
+image:
+  repository: 457497801237.dkr.ecr.us-east-1.amazonaws.com/transmission/mesh
+  tag: 5e172d9b
+  pullPolicy: IfNotPresent
+
+# ─────────────────────────────────────────────────────────────────────────────
+# The cron itself. dbt metadata drifts slowly (grain/lineage change on a merged
+# model PR, not minute-to-minute), so a NIGHTLY sync is ample — 07:00 UTC (off
+# the skill-import 06:00 tick so the two batch jobs don't collide). Forbid
+# overlap; a failed pass becomes a Failed Job (alertable) and the next tick
+# retries (the table is untouched / partially refreshed on failure).
+# restartPolicy=Never + backoffLimit=1: don't hammer in place.
+#
+# ★ INTERIM S3 seed. There is NO real dbt-CI manifest-publishing job yet
+# (Raghu's call): Farrah's committed manifest.json was manually dropped into a
+# dev S3 bucket as an interim source, and the bucket/key below point at it. The
+# real dbt-refresh publishing job (dbt build → this bucket) comes later. The
+# mesh SA's `s3:GetObject` grant on that object is still PENDING — the mesh role
+# (transmission-dev-mesh) is terraform-managed, so the grant belongs in the
+# transmission-runtime terraform (core/identity), not an ad-hoc CLI mutation;
+# do NOT enable-in-anger until that grant lands. The S3ManifestSource reads
+# TOKENLESS under the mesh SA's pod-identity role — no keys here.
+# ─────────────────────────────────────────────────────────────────────────────
+cronjob:
+  enabled: true
+  schedule: "0 7 * * *"          # nightly at 07:00
+  timeZone: "UTC"
+  command:
+    - "python"
+    - "scripts/refresh_dbt_models.py"
+    - "--source=s3"
+    - "--bucket"
+    - "transmission-dbt-dev-457497801237"   # interim dev bucket (Farrah's manifest, manually seeded)
+    - "--key"
+    - "dbt/manifest.json"                     # interim manifest object key
+  concurrencyPolicy: Forbid
+  restartPolicy: Never
+  backoffLimit: 1
+  activeDeadlineSeconds: 1800
+
+# Pod Identity: REUSE the mesh SA — its role (transmission-dev-mesh) already holds
+# AssumeRole+TagSession+SetSourceIdentity into transmission-recall-dev-app (the RW
+# role), which is exactly the credential the dbt-model UPSERT needs. ★ ONE new IAM
+# grant is required before enabling: `s3:GetObject` on the manifest object above
+# (arn:aws:s3:::transmission-dbt-dev-457497801237/dbt/manifest.json), the ONLY new
+# credential this job needs (the S3 read is tokenless/ambient under this same
+# pod-identity role). That role is TERRAFORM-managed (ManagedBy=terraform,
+# Component=runtime — a single inline policy `transmission-dev-mesh`), so the grant
+# must be added in the transmission-runtime terraform, NOT by an out-of-band CLI
+# put-role-policy (which would drift against IaC). Proposed statement:
+#   { "Sid": "ReadDbtManifest", "Effect": "Allow", "Action": "s3:GetObject",
+#     "Resource": "arn:aws:s3:::transmission-dbt-dev-457497801237/dbt/manifest.json" }
+# Until it lands, an in-pod --source=s3 run fails at get_object (AccessDenied) —
+# verified 2026-07-19 — with NO DB write (fetch precedes any upsert). Pending
+# core/identity sign-off.
+serviceAccount:
+  create: false
+  name: mesh
+
+# No autoscaler / no PDB / no ingress — a batch job has none of these.
+hpa:
+  enabled: false
+ingress:
+  enabled: false
+# A CronJob has no listen port, so the default-deny *ingress* NetworkPolicy is
+# moot; skip it (egress to Recall/S3/STS/LiteLLM is unrestricted, same as services).
+networkPolicy:
+  enabled: false
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Config → ConfigMap. The job needs: the RW Recall path (transmission_app, IAM)
+# for the UPSERT, and the LiteLLM gateway (this job EMBEDS each model's
+# description as a cohere-embed-v4 vector on write). The S3 read needs NO env —
+# it runs tokenless under the mesh SA's IRSA role (region resolves from the pod).
+# ─────────────────────────────────────────────────────────────────────────────
+env:
+  - name: ENVIRONMENT
+    value: dev
+
+  # Observability — same collector as the services.
+  - name: OTEL_EXPORTER_OTLP_ENDPOINT
+    value: http://otel-collector.observability:4318
+  - name: OTEL_SERVICE_NAME
+    value: dbt-refresh
+
+  # Model gateway — the ingest EMBEDS each model description (cohere-embed-v4)
+  # on write. LITELLM_API_KEY (the gateway virtual key) is in the Secret.
+  - name: LITELLM_BASE_URL
+    value: https://litellm.datasci.d-gurus.com
+
+  # Recall RW path. The UPSERT runs as transmission_app over the mirror's pool
+  # builder (mesh.mirror.db, RECALL_WRITE_ROLE). RECALL_USE_IAM=1 → the pool mints
+  # an RDS IAM token per connection; transmission-recall-dev-app `rds-db:connect`s
+  # ONLY as transmission_app (the strict role↔DB-user pairing). No DB password /
+  # secret needed under IAM.
+  - name: RECALL_USE_IAM
+    value: "true"
+  - name: RECALL_WRITE_ROLE
+    value: transmission_app
+  - name: RECALL_APP_ROLE_ARN
+    value: arn:aws:iam::457497801237:role/transmission-recall-dev-app
+
+# LITELLM_API_KEY (the gateway virtual key) lives in the mesh-secrets Secret —
+# the same Secret the mesh service uses; reused here for the embed call.
+envFromSecret: mesh-secrets
+
+# A batch pass is light (one S3 GET + a manifest parse + a batch of embeds + UPSERTs).
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi

@@ -1,0 +1,21 @@
+{{ include "transmission.name" . }} deployed to namespace {{ include "transmission.namespace" . }}.
+
+  Release:   {{ .Release.Name }}
+  Image:     {{ .Values.image.repository }}:{{ .Values.image.tag }}
+  Replicas:  {{ .Values.replicas.min }}{{ if .Values.hpa.enabled }}–{{ .Values.replicas.max }} (HPA on {{ .Values.hpa.targetCPUUtilizationPercentage }}% CPU){{ end }}
+
+{{- if .Values.ingress.enabled }}
+
+  Ingress:   https://{{ .Values.ingress.hostname }}{{ .Values.ingress.path }}
+             ALB group "{{ .Values.ingress.groupName }}" (scheme: {{ .Values.ingress.scheme }})
+             Route 53 record managed by external-dns (DS-2795).
+{{- if not .Values.ingress.certificateArn }}
+             NOTE: no certificateArn set — ALB is HTTP-only until DS-2798 wires the ACM cert.
+{{- end }}
+{{- else }}
+
+  Ingress:   disabled (cluster-internal service only).
+{{- end }}
+
+Check rollout:
+  kubectl -n {{ include "transmission.namespace" . }} rollout status deploy/{{ include "transmission.name" . }}

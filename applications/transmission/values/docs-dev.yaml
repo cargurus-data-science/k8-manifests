@@ -1,0 +1,92 @@
+# Architecture docs site — dev environment values.
+#
+# Layered over chart/values.yaml by:
+#   helm upgrade --install docs chart/ \
+#     --values chart/values/docs-dev.yaml
+#
+# nginx serving the static MkDocs build (services/docs/Dockerfile). Served under
+# /docs on the dashboard hostname (turbo.datasci.d-gurus.com/docs) by
+# joining the shared "transmission-dashboard" ALB group — no backend, no AWS calls.
+service:
+  name: docs
+  port: 80
+
+image:
+  repository: 457497801237.dkr.ecr.us-east-1.amazonaws.com/transmission/docs
+  tag: e5c35e26
+  pullPolicy: IfNotPresent
+
+# Static assets: one replica, no autoscaling. With hpa disabled the Deployment is
+# pinned to replicas.min, and the PDB auto-skips (a 1-pod PDB blocks node drains).
+replicas:
+  min: 1
+  max: 1
+hpa:
+  enabled: false
+
+serviceAccount:
+  # No AWS calls from nginx, but Pod Identity still wants a named SA per pod.
+  create: true
+  name: docs
+
+# Served at turbo.datasci.d-gurus.com/docs by JOINING the dashboard's
+# shared ALB group. Path precedence within the group (lower groupOrder wins):
+#   /api  -> dashboard-backend  (groupOrder 10)
+#   /docs -> docs               (groupOrder 15)  <- here
+#   /     -> dashboard-frontend (groupOrder 20, the catch-all)
+# The ALB-level annotations (scheme, targetType, certificateArn) MUST be
+# byte-identical across every member of a group or the load-balancer controller
+# stops reconciling it — so these mirror the dashboard values exactly.
+ingress:
+  enabled: true
+  hostname: turbo.datasci.d-gurus.com
+  path: /docs
+  groupName: transmission-dashboard
+  groupOrder: 15
+  # nginx serves the site rooted at /docs (see services/docs/nginx.conf), so a
+  # bare "/" would 404 on the pod and mark the target unhealthy — probe /docs/.
+  healthcheckPath: /docs/
+  # Byte-identical to the dashboard front/back-end cert (shared ALB group).
+  certificateArn: "arn:aws:acm:us-east-1:457497801237:certificate/4e3c9e91-1ac4-4ec2-a4f0-f007b72cd25e"
+
+# Probes hit nginx on :80. The site is rooted at /docs/, so "/" is not served.
+probes:
+  liveness:
+    path: /docs/
+  readiness:
+    path: /docs/
+  startup:
+    path: /docs/
+
+# Stock nginx:1 runs its master as root. The chart default drops ALL Linux caps,
+# which CrashLoops nginx at startup. Keep least-privilege (drop ALL) but add back
+# exactly the caps the root master needs to boot:
+#   NET_BIND_SERVICE — bind the privileged :80 listen socket
+#   CHOWN            — chown /var/cache/nginx/*_temp to the worker user (101)
+#   SETUID, SETGID   — fork workers and drop them to that unprivileged user
+# (Mirrors dashboard-frontend / edge-frontend, which hit the same CrashLoop.)
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+    add:
+      - NET_BIND_SERVICE
+      - CHOWN
+      - SETUID
+      - SETGID
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    cpu: 200m
+    memory: 128Mi
+
+networkPolicy:
+  enabled: true
+  allowFromNamespaces:
+    - transmission
+    - kube-system
+  allowFromCIDRs: []

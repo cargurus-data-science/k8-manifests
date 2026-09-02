@@ -1,0 +1,62 @@
+{{- if .Values.ingress.enabled -}}
+{{- $svc := include "transmission.name" . -}}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ $svc }}
+  namespace: {{ include "transmission.namespace" . }}
+  labels:
+    {{- include "transmission.labels" . | nindent 4 }}
+  annotations:
+    # external-dns (DS-2795, private zone, policy=sync) reads this and creates
+    # the Route 53 A-record pointing at the ALB. No manual DNS.
+    external-dns.alpha.kubernetes.io/hostname: {{ required "ingress.hostname is required when ingress.enabled" .Values.ingress.hostname | quote }}
+    # AWS Load Balancer Controller (DS-2795) provisions the ALB from here.
+    alb.ingress.kubernetes.io/scheme: {{ .Values.ingress.scheme | quote }}
+    alb.ingress.kubernetes.io/target-type: {{ .Values.ingress.targetType | quote }}
+    {{- /* SHARED ALB: services on the same hostname must share group.name, or
+           the controller makes one ALB per Ingress and external-dns thrashes the
+           single A-record. groupOrder sets rule precedence (lower = first). */}}
+    {{- if .Values.ingress.groupName }}
+    alb.ingress.kubernetes.io/group.name: {{ .Values.ingress.groupName | quote }}
+    alb.ingress.kubernetes.io/group.order: {{ .Values.ingress.groupOrder | quote }}
+    {{- end }}
+    {{- /* With target-type=ip the ALB health-checks pod IPs directly. Default a
+           backend's check to a real 200 path, else all targets read unhealthy. */}}
+    alb.ingress.kubernetes.io/healthcheck-path: {{ .Values.ingress.healthcheckPath | default .Values.ingress.path | quote }}
+    {{- if .Values.ingress.certificateArn }}
+    # HTTPS: ALB listens on 443 with this ACM cert (provisioned by DS-2798) and
+    # redirects 80→443.
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP":80},{"HTTPS":443}]'
+    alb.ingress.kubernetes.io/ssl-redirect: '443'
+    alb.ingress.kubernetes.io/certificate-arn: {{ .Values.ingress.certificateArn | quote }}
+    {{- else }}
+    # No ACM cert yet — HTTP-only until DS-2798 provisions one.
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP":80}]'
+    {{- end }}
+    {{- with .Values.ingress.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  ingressClassName: {{ .Values.ingress.ingressClassName }}
+  rules:
+    - host: {{ .Values.ingress.hostname | quote }}
+      http:
+        paths:
+          - path: {{ .Values.ingress.path }}
+            pathType: {{ .Values.ingress.pathType }}
+            backend:
+              service:
+                name: {{ $svc }}
+                port:
+                  {{- /* Default: the single Service port. `servicePortName` targets
+                         one of `service.extraPorts` instead, by NAME — needed when a
+                         multi-port pod must be fronted on a port that is not the
+                         dataplane one (hindsight: the console on 9999, never the
+                         token-authenticated API on 8888). */}}
+                  {{- if .Values.ingress.servicePortName }}
+                  name: {{ .Values.ingress.servicePortName }}
+                  {{- else }}
+                  number: {{ .Values.service.port }}
+                  {{- end }}
+{{- end }}

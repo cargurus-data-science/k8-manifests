@@ -1,0 +1,326 @@
+# Transmission chart — default values.
+#
+# This file is the SCHEMA + safe defaults. Every key here can be overridden by a
+# per-service-per-env file in chart/values/<service>-<env>.yaml. Nothing should
+# be deployed off bare defaults — a service is always installed with
+# `--values chart/values/<service>-<env>.yaml` layered on top of these.
+#
+# See chart/README.md for the conventions and "how to add a service".
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Namespace — PRODUCT-LEVEL, not per-service.
+#
+# All Transmission services share one namespace. This MUST equal the `namespace`
+# in DS-2795's aws_eks_pod_identity_association resources, or Pod Identity won't
+# bind the pod's ServiceAccount to its IAM role. Do not override per service.
+# ─────────────────────────────────────────────────────────────────────────────
+namespace: transmission
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Service identity — the one value every override MUST set.
+# `name` is the canonical handle: Deployment, Service, Ingress, HPA, PDB,
+# ConfigMap, and selector labels are all keyed off it.
+# `port` is the container's listen port AND the Service port (kept equal — the
+# ALB target-type=ip routes straight to the pod on this port).
+# ─────────────────────────────────────────────────────────────────────────────
+service:
+  name: ""              # REQUIRED override, e.g. "dashboard-backend"
+  port: 8000
+  type: ClusterIP
+  # Whether the container advertises a listen port (and a Service object exists).
+  # true for every HTTP service (unchanged default). Set FALSE for a long-lived
+  # OUTBOUND-only workload — the Slack Socket Mode listener dials Slack and nothing
+  # connects to it, so a containerPort would imply a surface it doesn't have.
+  exposePort: true
+  # ADDITIONAL listen ports, for the rare workload whose image starts more than
+  # one server in ONE process tree. Each entry renders a containerPort, a Service
+  # port of the same name, and a NetworkPolicy allow. `[]` (the default) renders
+  # nothing at all — every existing service is byte-identical.
+  #
+  #   extraPorts:
+  #     - name: console       # a DNS-1123 label, <=15 chars (k8s port-name rule)
+  #       port: 9999
+  #
+  # Why this and not a second Helm release, which was tried first: the Service
+  # selector (_helpers.tpl `transmission.selectorLabels`) pins
+  # `app.kubernetes.io/instance: {{ .Release.Name }}`, so a second release either
+  # renders a whole second pod — for hindsight a 4.2GB vendor image with a
+  # DUPLICATE HINDSIGHT_API_WORKER_ID, the exact orphaned-task bug that env var
+  # exists to prevent — or, if `service.name` is kept, a Service whose `instance`
+  # label matches no pod and which therefore has ZERO ENDPOINTS. One pod with
+  # additional ports is the standard Kubernetes shape.
+  #
+  # Only honoured when `exposePort` is true (the whole `ports:` block is opt-out),
+  # and never on the `cronjob.enabled` branch, which renders no pod and no Service.
+  # Front one of these with an Ingress via `ingress.servicePortName` below.
+  extraPorts: []
+
+# Optional entrypoint override for the DEPLOYMENT path (the sibling of
+# `cronjob.command`, which serves the batch path). Unset (the default) → the
+# image's own CMD runs, byte-identical to every existing service. Set it only for
+# a long-lived NON-SERVER workload that reuses a service image: the Slack Socket
+# Mode listener (`["python", "scripts/standup_socket.py"]`) runs in the mesh image
+# but must not start `fastapi run`.
+command: []
+
+# Container image. Registry is CG ECR (account 457497801237, us-east-1).
+# tag is overridden per deploy by CI to the built image SHA/tag.
+image:
+  repository: ""        # REQUIRED override, e.g. ".../transmission/dashboard-backend"
+  tag: latest
+  pullPolicy: IfNotPresent
+
+# Replica bounds. When hpa.enabled, these are the HPA min/max; otherwise the
+# Deployment is pinned to replicas.min.
+replicas:
+  min: 1
+  max: 2
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ServiceAccount — Pod Identity (NOT IRSA).
+#
+# DS-2795 runs the cluster with enable_irsa=false (no OIDC provider). The
+# SA→IAM binding is created control-plane-side by aws_eks_pod_identity_association
+# keyed on (namespace, service_account). So this template carries NO
+# eks.amazonaws.com/role-arn annotation — the chart's only job is to create a
+# ServiceAccount whose (namespace, name) matches what DS-2795 associated.
+#
+# `name` MUST match the service_account in DS-2795's association for this service.
+# ─────────────────────────────────────────────────────────────────────────────
+serviceAccount:
+  create: true
+  name: ""              # REQUIRED override; must match DS-2795 association
+  # Extra annotations if a service ever needs them. Leave empty for Pod Identity
+  # — do NOT add eks.amazonaws.com/role-arn here.
+  annotations: {}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Ingress — AWS Load Balancer Controller (ALB) + external-dns, both stood up by
+# DS-2795 as cluster controllers.
+#
+#   * external-dns watches Ingresses and creates the Route 53 A-record from the
+#     `external-dns.alpha.kubernetes.io/hostname` annotation (private zone,
+#     policy=sync).
+#   * the ALB controller provisions an ALB from the alb.ingress.* annotations.
+#
+# SHARED ALB (group.name): services that share a hostname (e.g. dashboard
+# backend at /api and frontend at /) MUST share `ingress.groupName`, or the
+# controller provisions one ALB per Ingress and external-dns thrashes the single
+# A-record. Same group.name => one ALB, path-routed. `groupOrder` sets rule
+# precedence within the group (lower = evaluated first; put specific paths like
+# /api ahead of the catch-all /).
+# ─────────────────────────────────────────────────────────────────────────────
+ingress:
+  enabled: false
+  ingressClassName: alb
+  hostname: ""          # e.g. "turbo.datasci.d-gurus.com"
+  path: /
+  pathType: Prefix
+  scheme: internal      # CG dev ALBs are internal-only
+  targetType: ip        # route straight to pod IPs (works with ClusterIP svc)
+  # Shared-ALB grouping. Services on the same hostname MUST share groupName.
+  groupName: ""         # e.g. "transmission-dashboard"
+  groupOrder: 10        # lower = higher precedence; specific paths get lower
+  # ACM cert ARN. Empty => HTTP-only (ALB listens on :80). Set => ALB also
+  # listens on :443 with this cert. Provisioned per-deploy by DS-2798, not here.
+  certificateArn: ""
+  # ALB target-group health check. With target-type=ip the ALB probes the pod
+  # directly, so this MUST be a path that returns 200 on the container port
+  # (e.g. backend "/api/health/live", frontend "/"). Defaults to ingress.path.
+  healthcheckPath: ""
+  # Which Service port this Ingress routes to. Empty (the default) => the single
+  # `service.port`, by number — unchanged for every service. Set it to the NAME of
+  # a `service.extraPorts` entry to front a secondary port instead. Names, not
+  # numbers, so the Service and Ingress cannot drift.
+  servicePortName: ""
+  # Extra alb.ingress.kubernetes.io/* annotations, merged last (escape hatch).
+  annotations: {}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Container environment.
+#   env             — plain name/value pairs, rendered into the Deployment AND a
+#                     ConfigMap (so config is inspectable via `kubectl get cm`).
+#   envFromSecret   — name of a Secret (managed out of band: Secrets Manager ->
+#                     k8s) whose keys are injected via envFrom. Empty => no secret.
+#   secretVersion   — an OPAQUE ROTATION MARKER. See below; this one has teeth.
+# ─────────────────────────────────────────────────────────────────────────────
+env: []
+envFromSecret: ""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# secretVersion — the rotation marker that makes a Secret change roll the pods.
+#
+# THE BUG THIS EXISTS FOR. `envFrom.secretRef` values are read once, at pod
+# start. `checksum/config` (templates/deployment.yaml) hashes `.Values.env` only,
+# and nothing hashes the Secret — we do not render it, so Helm cannot see its
+# contents at template time. So: rotate a key in `mesh-secrets`, run
+# `helm upgrade` with unchanged values, and the pod template is byte-identical =>
+# no new ReplicaSet => the running pod keeps the OLD credential, while
+# `helm upgrade` exits 0 reporting success. Caught live 2026-08-11: a pod served
+# happily with a credential for a DB role that had just been dropped.
+#
+# HOW TO USE IT: on any rotation of the Secret this service reads, change this
+# string. Any change works — it is hashed into the pod annotation, not parsed.
+# A date plus a word is plenty: "2026-08-11-cp-key".
+#
+# WHY NOT `lookup`, which would be automatic: measured on this chart, a
+# `lookup`-based checksum renders the sha of the literal string "null" under
+# plain `helm template` and the real Secret hash under `--dry-run=server`. Two
+# different renders of one commit, and every pre-deploy diff we do goes through
+# plain `helm template`. A checksum that is wrong in the tool we use to verify
+# deploys is worse than an explicit marker. (Our CI never dry-runs — deploy.yml
+# only ever runs `helm upgrade --install` — so `lookup` would have been safe
+# THERE; it is our own verification path that breaks.)
+#
+# AND THE BACKSTOP, because a marker relies on someone remembering: after any
+# Secret change, `kubectl rollout restart deploy/<svc>`. That is unconditional
+# and does not depend on this field. The field exists so the rotation is
+# RECORDED IN GIT even when someone forgets the restart.
+#
+# CronJobs do not need this: every tick creates a fresh pod, which reads the
+# Secret as it is then. Verified on review-sweep — successive ticks produce
+# distinct pods (…-29774265, …-29774280, …-29774295). A stale-credential CronJob
+# is not a thing that can happen, so cronjob.yaml deliberately carries no
+# checksum annotation.
+secretVersion: ""
+
+# Resource requests/limits. Always set per service — these defaults are a floor.
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Security context.
+#
+# Pod-level default applies the RuntimeDefault seccomp profile. We do NOT default
+# `runAsNonRoot: true`: the current service images (python:3.12-slim,
+# nginx:1) run as root with no baked-in non-root USER, so enforcing it without a
+# matching runAsUser blocks startup. Hardening the Dockerfiles to a non-root UID
+# and flipping this on is a tracked follow-up (surfaced to the Manager).
+#
+# Container-level default forbids privilege escalation and drops all Linux
+# capabilities — correct for the Python services (FastAPI on a high port needs no
+# caps). The nginx frontend overrides this (it binds :80 and forks workers, so it
+# needs the default cap set).
+# ─────────────────────────────────────────────────────────────────────────────
+podSecurityContext:
+  seccompProfile:
+    type: RuntimeDefault
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CronJob — a SCHEDULED BATCH job, not a long-running service.
+#
+# Default off: a normal service install (mesh, dashboard-*, edge-*) renders a
+# Deployment + Service. A scheduled-job install (e.g. the M1.5
+# LearningConsolidationJob) layers a values file that sets `cronjob.enabled: true`
+# — which FLIPS the chart to render a `batch/v1` CronJob (templates/cronjob.yaml)
+# and SUPPRESS the Deployment + Service (a job has no listen port). One
+# parameterized chart, two workload shapes — never a second chart.
+# ─────────────────────────────────────────────────────────────────────────────
+cronjob:
+  enabled: false
+  # Cron schedule (cluster TZ unless `timeZone` set). M1.5 = every 6 hours.
+  schedule: "0 */6 * * *"
+  timeZone: ""                 # e.g. "UTC"; empty => cluster default
+  # Argv for the batch container (the script entrypoint). Overridden per job.
+  command: ["python", "scripts/consolidate_learnings.py"]
+  # Serialize re-runs: a slow pass must not overlap a new tick.
+  concurrencyPolicy: Forbid
+  # If a tick is missed (controller down), don't start a run more than this many
+  # seconds late — a stale hygiene pass is pointless; wait for the next tick.
+  startingDeadlineSeconds: 300
+  # Keep a little history for `kubectl get jobs` debugging; don't accrete pods.
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  # A failed pass surfaces as a Failed Job (alertable). Don't retry in place hard
+  # — the next 6h tick is the real retry; the corpus is untouched on failure.
+  restartPolicy: Never
+  backoffLimit: 1
+  # Hard wall-clock cap on one pass (seconds). Empty => no cap.
+  activeDeadlineSeconds: 1800
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Horizontal Pod Autoscaler. When disabled, Deployment is pinned to replicas.min.
+# ─────────────────────────────────────────────────────────────────────────────
+hpa:
+  enabled: true
+  targetCPUUtilizationPercentage: 70
+  # Optional; only emitted when set.
+  targetMemoryUtilizationPercentage: null
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PodDisruptionBudget. minAvailable wins if both are set. Auto-skips for
+# single-replica services where a PDB would block node drains (see template).
+# ─────────────────────────────────────────────────────────────────────────────
+pdb:
+  enabled: true
+  minAvailable: 1
+  maxUnavailable: null
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Health probes. Each maps to one HTTP GET on the container port.
+# Backend exposes /api/health/{live,ready,startup}; frontend (nginx) serves "/".
+# Disable a probe by setting its `enabled: false`.
+# ─────────────────────────────────────────────────────────────────────────────
+probes:
+  liveness:
+    enabled: true
+    path: /health/live
+    initialDelaySeconds: 10
+    periodSeconds: 10
+    timeoutSeconds: 2
+    failureThreshold: 3
+  readiness:
+    enabled: true
+    path: /health/ready
+    initialDelaySeconds: 5
+    periodSeconds: 10
+    timeoutSeconds: 2
+    failureThreshold: 3
+  startup:
+    enabled: true
+    path: /health/startup
+    initialDelaySeconds: 5
+    periodSeconds: 5
+    timeoutSeconds: 2
+    failureThreshold: 30
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NetworkPolicy. Default-deny ingress with an explicit allow from the cluster's
+# ALB/ingress traffic. Egress is left open (pods reach Recall/Bedrock/AWS APIs).
+# ─────────────────────────────────────────────────────────────────────────────
+networkPolicy:
+  enabled: true
+  # Namespaces allowed to send traffic to this service's pods on service.port
+  # (e.g. frontend->backend, both in `transmission`).
+  allowFromNamespaces:
+    - transmission
+    - kube-system
+  # CIDRs allowed to send traffic. REQUIRED for ALB ingress: with
+  # ingress.targetType=ip the ALB dials pod IPs from VPC subnets, NOT from a
+  # pod in an allowed namespace — a namespace-only allow would drop ALB traffic
+  # if/when CNI enforcement is enabled. Set this to the VPC/private-subnet CIDR
+  # for any service fronted by an Ingress. Empty => no CIDR allow.
+  allowFromCIDRs: []
+
+# Optional scheduling controls (passthrough; empty => no constraint).
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# Optional pod-level metadata (e.g. OTel/Prometheus hints).
+podAnnotations: {}
+podLabels: {}
+
+# Optional graceful-shutdown window (seconds). Null => k8s default (30).
+terminationGracePeriodSeconds: null
