@@ -13,7 +13,7 @@ backend:
     tag: REPLACE_ME_IMAGE_SHA                 # immutable SHA per deploy
     pullPolicy: IfNotPresent
   targetGroupArn: REPLACE_ME_BACKEND_TG_ARN   # modules/alb output
-  serviceAccountName: turbo-app
+  serviceAccountName: turbo
   resources:
     requests:
       cpu: "2"
