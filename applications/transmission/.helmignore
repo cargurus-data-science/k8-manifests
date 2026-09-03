@@ -1,0 +1,11 @@
+# Patterns to ignore when packaging the chart.
+.DS_Store
+.git/
+.gitignore
+*.swp
+*.swo
+*.bak
+*.tmp
+*~
+# The README documents conventions for humans; not needed inside a packaged chart.
+# (Left packaged intentionally — it's small and useful in `helm show readme`.)

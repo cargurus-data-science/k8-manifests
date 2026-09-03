@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: risingwave-config
+  namespace: risingwave
+  labels:
+    team: data-science
+data:
+  # Force the legacy aws-sdk-rust S3 client instead of OpenDAL/reqsign.
+  # aws-sdk-rust's provider chain reads AWS_CONTAINER_CREDENTIALS_FULL_URI
+  # (EKS Pod Identity), which reqsign ignores. Developer-tier flag: pin the
+  # RisingWave image version so this behavior can't shift under `latest`.
+  risingwave.toml: |
+    [storage.object_store.s3.developer]
+    use_opendal = false

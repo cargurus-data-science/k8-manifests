@@ -1,0 +1,177 @@
+# checkpoint-reaper (R5 / #626 requirement 2) — the checkpoint-thread
+# retention sweep. TWO phases in one pass:
+#   1. prlane:*/prgeneral:* — reaped once their PR is confirmed closed (merged
+#      PRs report closed too); never on a staleness/TTL guess, never for an
+#      unreadable PR (fail closed).
+#   2. slack:* / jira:* — an IDLE TTL (30d / 90d), because these have no
+#      "closed" signal at all. Per-prefix by design: a PR conversation outlives
+#      a Slack chat. See mesh/flow/checkpoint_reaper.py's policy table.
+# Neither phase ever reaps a thread holding an ACTIVE run.
+#
+# ★ NOT config-driven: langgraph.json's `checkpointer.ttl` block is a LangGraph
+# Platform feature (we don't run the Platform) and our pinned
+# AsyncPostgresSaver has no ttl param, so it would be inert. This cron IS the
+# mechanism — no values change was needed for phase 2, the schedule and
+# resources below already cover it.
+#
+# A SCHEDULED BATCH job, not a service — same shape as review-sweep-dev.yaml.
+#
+#   helm upgrade --install checkpoint-reaper chart/ \
+#     --namespace transmission \
+#     --values chart/values/checkpoint-reaper-dev.yaml \
+#     --set image.tag=<sha> --wait --atomic
+#
+# Release name = service name = values stem = `checkpoint-reaper` — the
+# convention deploy.yml's matrix follows (deploy-convention-release-name-trap).
+# ★ This name MUST also be in deploy.yml's SERVICES array (the #317 miss:
+# without it, `helm upgrade --install` never runs and the CronJob object is
+# never created in-cluster).
+#
+# `cronjob.enabled: true` flips the chart to render a `batch/v1` CronJob and
+# SUPPRESS the Deployment + Service. Reuses the mesh image (scripts/ +
+# mesh.flow.checkpoint_reaper ship via the whole-dir COPY scripts — no
+# Dockerfile edit).
+#
+# Read + delete only: no LLM call and it never DISPATCHES a Mode (unlike
+# review-sweep). It reads GitHub PR state (read PAT), reads the origin-run scan-set
+# + memory.run.sandbox_ids (RO), deletes via AsyncPostgresSaver.adelete_thread on
+# the checkpointer's OWN transmission_langgraph connection — and now KILLS PAUSED
+# CRATE VMs (see the E2B_* block below).
+service:
+  # Resource handle (CronJob/SA/ConfigMap name). NOT a listen port — a job has
+  # no inbound traffic; `port` is unused here but the schema requires
+  # service.name.
+  name: checkpoint-reaper
+
+# Reuse the mesh image: it already carries the shared `mesh` library + scripts/
+# (Dockerfile builds from repo root). CI pins the real SHA via --set image.tag.
+image:
+  repository: 457497801237.dkr.ecr.us-east-1.amazonaws.com/transmission/mesh
+  tag: 5e172d9b
+  pullPolicy: IfNotPresent
+
+# ─────────────────────────────────────────────────────────────────────────────
+# The cron itself — DAILY (retention is housekeeping, not a hot path — unlike
+# the */15 review sweep, there is no latency requirement on reaping a closed
+# PR's threads). Daily suits the idle phase too: its TTLs are 30/90 DAYS, so
+# hourly would buy nothing. concurrencyPolicy=Forbid serializes; restartPolicy=Never +
+# backoffLimit=1: don't hammer in place — a failed pass becomes a Failed Job
+# (alertable) and the next day's tick retries (nothing is deleted until BOTH
+# a PR is confirmed closed AND the delete call succeeds, so a mid-pass failure
+# leaves the rest untouched).
+# ─────────────────────────────────────────────────────────────────────────────
+cronjob:
+  enabled: true
+  suspend: false
+  schedule: "0 7 * * *"       # once a day, 07:00 UTC
+  timeZone: "UTC"
+  command: ["python", "scripts/checkpoint_reaper.py"]
+  concurrencyPolicy: Forbid
+  restartPolicy: Never
+  backoffLimit: 1
+  activeDeadlineSeconds: 900   # a reap is a handful of REST lists + deletes
+
+# Pod Identity: REUSE the mesh SA — its role (transmission-dev-mesh) already
+# holds AssumeRole+TagSession+SetSourceIdentity into BOTH
+# transmission-recall-dev-app (the origin-run scan-set read) AND
+# transmission-recall-dev-langgraph (the checkpointer's own role, for the
+# discovery read + adelete_thread) — no new IAM, no new credential path.
+serviceAccount:
+  create: false
+  name: mesh
+
+# No autoscaler / no PDB / no ingress — a batch job has none of these.
+hpa:
+  enabled: false
+ingress:
+  enabled: false
+# A CronJob has no listen port, so the default-deny *ingress* NetworkPolicy is
+# moot; skip it (egress to Recall/STS/GHES is unrestricted, same as services).
+networkPolicy:
+  enabled: false
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Config → ConfigMap. Two Recall connections (the origin-run scan-set read as
+# transmission_app, and the checkpointer's own transmission_langgraph — see
+# CheckpointerSettings in mesh/flow/checkpointer.py, which reads
+# RECALL_USE_IAM/RECALL_LANGGRAPH_ROLE_ARN independently of the mirror's
+# RECALL_APP_ROLE_ARN) plus the GitHub read config. No LiteLLM — this job never
+# dispatches a Mode, unlike review-sweep-dev. ★ It DOES talk to Crate now (E2B_*
+# below): it kills paused session VMs, but only ever kills — it never CREATES a
+# sandbox, so there is no template, no envs, no in-VM credential here.
+# ─────────────────────────────────────────────────────────────────────────────
+env:
+  - name: ENVIRONMENT
+    value: dev
+
+  # Observability — same collector as the services.
+  - name: OTEL_EXPORTER_OTLP_ENDPOINT
+    value: http://otel-collector.observability:4318
+  - name: OTEL_SERVICE_NAME
+    value: checkpoint-reaper
+
+  # Recall RW path — the origin-run scan-set SELECT reuses the mirror's pool
+  # builder (mesh.mirror.db, read-only usage here). RECALL_USE_IAM=1 mints an
+  # RDS IAM token per connection; transmission-recall-dev-app `rds-db:connect`s
+  # ONLY as transmission_app (the strict role↔DB-user pairing).
+  - name: RECALL_USE_IAM
+    value: "true"
+  - name: RECALL_WRITE_ROLE
+    value: transmission_app
+  - name: RECALL_APP_ROLE_ARN
+    value: arn:aws:iam::457497801237:role/transmission-recall-dev-app
+
+  # ─── Crate: the paused-VM reaper ──────────────────────────────────────────
+  # ★ KILL-ONLY. This job destroys paused session sandboxes by id; it never
+  # creates one, so it needs no E2B_TEMPLATE / SANDBOX_TYPE / session-timeout
+  # (contrast review-sweep-dev.yaml, which DISPATCHES a sandbox Mode).
+  # E2B_API_KEY is already delivered by `envFromSecret: mesh-secrets` below
+  # (verified present in-cluster 2026-07-30) — only the plain domain is needed
+  # here, exactly as it was for review-sweep.
+  - name: E2B_DOMAIN
+    value: crate.datasci.d-gurus.com
+
+  # ★ THE PAUSED-SANDBOX AGE CEILING, in hours of IDLENESS — the backstop for a
+  # session that stalls without ever closing (a closed/merged PR is reaped by the
+  # closed-PR phase instead). Deliberately an ENV VAR rather than a constant in
+  # code: tuning it is a ConfigMap edit, no image rebuild.
+  #
+  # 72h = a full weekend, which is the longest realistic human-review gap the α
+  # loop must not break (PR opens Friday, comments land Monday, the pass still
+  # resumes onto its own tree). Leaning SHORT on purpose — per-VM cost is
+  # unmeasured. Past that the tree's unique value (uncommitted edits, the git
+  # index) has decayed anyway, and the committed state is re-fetched regardless.
+  #
+  # ⚠ IDLENESS, NOT LIFETIME — this is why it cannot reap a live session:
+  # `started_at` resets on every resume and a paused VM's `end_at` is the pause
+  # instant, so a session actively taking passes keeps refreshing the clock. Only
+  # a genuinely dormant VM ages in. `0` disables the ceiling (the closed-PR reap
+  # keeps running).
+  - name: CRATE_PAUSED_MAX_IDLE_HOURS
+    value: "72"
+
+  # The checkpointer's OWN role — distinct from the mirror's above.
+  # mesh/flow/checkpointer.py's CheckpointerSettings defaults these; set
+  # explicitly here so the cron's config is self-documenting rather than
+  # relying on the Python default.
+  - name: LANGGRAPH_ROLE
+    value: transmission_langgraph
+  - name: RECALL_LANGGRAPH_ROLE_ARN
+    value: arn:aws:iam::457497801237:role/transmission-recall-dev-langgraph
+
+# mesh-secrets carries GH_PAT (the read-scoped GHES PAT for the PR-state read)
+# AND E2B_API_KEY, which the paused-VM reaper needs — ★ verified present
+# in-cluster 2026-07-30 (this comment previously asserted it was not needed; the
+# key was mounted all along). No GH_WRITE_PAT / GH_COMMENT_PAT / LITELLM_API_KEY:
+# this job never writes to GitHub and never calls the model gateway.
+envFromSecret: mesh-secrets
+
+# A reap is very light (a handful of REST lists + adelete_thread calls — no
+# LLM, no embeddings, no sandbox).
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi

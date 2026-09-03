@@ -1,0 +1,23 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Out-of-band RisingWave app bundle. Apply with:
+#   kubectl apply -k manifests/risingwave/
+# AFTER the operator install (server-side `kubectl apply` of the release
+# manifest, which provides the CRD) and the one-time
+# `postgresql-credentials` secret bootstrap — see README.md for the full order.
+#
+# Listed in dependency order for readers; Kustomize also kind-sorts on build
+# (Namespace → ServiceAccount → ConfigMap → the RisingWave CR last), so the CR
+# never applies before the objects it references.
+#
+# The `postgresql-credentials` Secret is deliberately NOT listed here: it holds
+# the RDS master password, is created imperatively from Secrets Manager, and must
+# never live in git. See README.md step 3. (Under ArgoCD it graduates to an
+# External Secrets Operator ExternalSecret against that same Secrets Manager
+# entry — declarative, and it fixes rotation drift.)
+resources:
+  - namespace.yaml
+  - serviceaccount.yaml
+  - configmap.yaml
+  - risingwave.yaml

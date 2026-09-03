@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: turbo-app-config
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "turbo.labels" . | nindent 4 }}
+    {{- include "turbo.backend.selectorLabels" . | nindent 4 }}
+data:
+  # PORT must equal the container port or uvicorn defaults to 8000 and the
+  # ALB health check (/healthz on :8080) never passes. See Global Constraints.
+  PORT: "8080"
+  {{- range $k, $v := .Values.backend.config }}
+  {{ $k }}: {{ $v | quote }}
+  {{- end }}

@@ -1,0 +1,644 @@
+# Open WebUI — a chat SHELL in front of Transmission's own agents — dev values.
+#
+# Layered over chart/values.yaml by:
+#   helm upgrade --install openwebui chart/ \
+#     --namespace transmission \
+#     --values chart/values/openwebui-dev.yaml --wait --atomic
+#
+# DEPLOY CONVENTION (deploy-convention-release-name trap): the Helm release name
+# == service.name == this file's stem == `openwebui`.
+#
+# WHAT THIS IS. The SECOND third-party vendor image in this chart, after
+# hindsight. It is PURE TRANSPORT: a browser chat UI that speaks the OpenAI wire
+# protocol to an endpoint we control. It hosts no agent, holds no warehouse
+# credential, and is not in any run path. If this pod is down, nothing breaks —
+# no flow, no run, no cron. That is deliberate and it is what makes the slice
+# reversible (same property, same wording, as hindsight-dev.yaml).
+#
+# ★ THERE IS NOW SOMETHING BEHIND IT (2026-08-13). This block used to read "AS OF
+# THIS DEPLOY THERE IS NOTHING BEHIND IT ... no /v1/chat/completions and no
+# /v1/models handler anywhere in the tracked tree" — that was true when this file
+# landed and is now stale. The core request was delivered: mesh serves both routes
+# from services/mesh/app/api/routes/chat_completions.py behind `LyraHarness`, and
+# #839 gated them with a shared-bearer check that fails CLOSED. It arrived as
+# routes ON MESH, not as the separate "shim" service this file anticipated, so
+# section 8 points at `mesh` itself. What is wired is a chat UI in front of a real
+# agent; what is NOT yet wired is a memory.run row per turn (mesh slice 2) and any
+# SQL-execution tool on that route.
+#
+# NOT wired into the deploy.yml services matrix — same reason as hindsight: that
+# matrix builds an image from a Dockerfile in this repo and pushes it to our ECR.
+# This is a vendor image we do not build, so there is nothing for CI to build or
+# tag. It installs by an explicit `helm upgrade --install`, and `image.tag` is
+# pinned HERE rather than by `--set image.tag=<sha>`.
+#
+# THE POSTURE BELOW IS MEASURED, NOT INFERRED. Every non-obvious env var traces
+# to .dev/note-openwebui-persistentconfig-probe.md §R3 (1,142 lines), which ran
+# this exact posture against an ALREADY-SEEDED database whose public.config rows
+# said the OPPOSITE, and to .dev/note-openwebui-real-agent-e2e.md, which drove a
+# real DeepAgentsHarness over the real LiteLLM gateway through it.
+#
+# ⚠★★ BUT READ THE IMAGE BLOCK BELOW BEFORE TRUSTING ANY "MEASURED" LABEL: the
+# build pinned here is NOT byte-identical to the build those notes measured, and
+# it is not even the same CPU ARCHITECTURE. The delta is characterized there.
+service:
+  name: openwebui
+  # 8080 is the image's own listen port (VERIFIED on the pinned amd64 build:
+  # its config declares ExposedPorts {"8080/tcp":{}} and Cmd ["bash","start.sh"]).
+  # One process, one port — no `service.extraPorts` needed, unlike hindsight's
+  # API+console pair.
+  port: 8080
+
+image:
+  # A THIRD-PARTY registry, not our ECR — the second such image in this chart.
+  #
+  # PINNED TO A RELEASE TAG, NEVER `:main`. `:main` is a MOVING BRANCH TAG —
+  # `latest` wearing a different name. Open WebUI runs Alembic on boot, so a
+  # moving tag lets the schema change under us on any pod recreate with no PR
+  # and no review. Same rule hindsight states: a vendor image that self-migrates
+  # its own schema on boot must not change under us silently.
+  #
+  # TAG RESOLVED 2026-08-11 (`crane ls`), and unlike hindsight's trap BOTH forms
+  # exist here: `v0.11.0` AND `0.11.0` are present and resolve to the SAME
+  # multi-arch index, sha256:72c0ba641ba75e7aa52655cb242570906ececd09b1140fb736
+  # 483038a22b3228. We take the `v`-prefixed form.
+  #
+  # ⇒ THE linux/amd64 CHILD DIGEST (both our nodes are amd64):
+  #     sha256:21a1ece1e32d1c79681c8d6b36a6f2f54abeb96d0f648965d793265dbef541f6
+  #   Its config labels read version=0.11.0,
+  #   revision=f9590b8017199e56d5e953657e6498e3cef1d246, created 2026-07-27.
+  #   (Same convention as hindsight, which records its own amd64 child digest.)
+  #
+  # ⚠★★ THIS IS NOT THE BUILD THE NOTES MEASURED, AND THE DIFFERENCE IS TWOFOLD.
+  #   The notes record "image sha256:6d8efb3fc96c..." — that string is NOT a
+  #   registry manifest digest at all. It is a LOCAL DOCKER IMAGE CONFIG ID, and
+  #   `crane manifest ...@sha256:6d8efb3f...` returns MANIFEST_UNKNOWN. It is the
+  #   config digest of the linux/ARM64 child of `:main` (the notes say so on
+  #   their own image line: "IMAGE ID 6d8efb3fc96c · linux/arm64"). So:
+  #     (1) ARCHITECTURE: every published measurement ran on arm64 (an Apple
+  #         Silicon laptop). This deploys amd64. Never exercised on arm64-vs-amd64
+  #         parity by anyone.
+  #     (2) CODE REVISION: the measured `:main` build is rev 01f4282f, which is
+  #         2 commits AHEAD of the v0.11.0 release tag (rev f9590b80). Those two
+  #         commits ("refac" + a merge) touch exactly ONE file, `hatch_build.py`
+  #         — build tooling, not runtime code. Both builds report
+  #         /app/package.json version 0.11.0.
+  #   ⇒ HONEST DISPOSITION: the delta is build-tooling-only and therefore very
+  #     likely behaviourally inert, but "likely inert" is not "measured." Treat
+  #     the notes' MEASURED labels for the ENV POSTURE (§1.5 / §4 of the brief)
+  #     as ASSUMED-FOR-THIS-BUILD until the brief's §4.4 gate is run against what
+  #     actually boots here. That gate is what closes this, and per §4.6 it
+  #     cannot run at all until the shim exists.
+  #   ⇒ WHAT *WAS* RE-MEASURED ON THIS EXACT amd64 DIGEST (2026-08-11, in Docker,
+  #     not on the cluster): it boots to `/health` 200 in ~36s on SQLite; the
+  #     probe paths below; and the ENABLE_SIGNUP behaviour noted at that var.
+  repository: ghcr.io/open-webui/open-webui
+  tag: v0.11.0
+  pullPolicy: IfNotPresent
+
+# One pod. Not for a worker-contention reason (unlike hindsight) but because
+# Open WebUI keeps per-process in-memory Config.DEFAULTS state under
+# ENABLE_PERSISTENT_CONFIG=false. Two replicas = two independent in-memory
+# posture copies that can drift from each other (see the runtime-revert hazard
+# in the probe note's R2.4). One pod makes the posture single-valued, and a
+# restart is the documented heal.
+replicas:
+  min: 1
+  max: 1
+hpa:
+  enabled: false
+# Single replica: a PDB with minAvailable 1 would block node drains. The chart
+# auto-skips this case, but state the intent explicitly.
+pdb:
+  enabled: false
+
+serviceAccount:
+  create: true
+  name: openwebui
+  # ⚠ NO AWS ACCESS IS NEEDED OR WANTED. The SA→IAM binding is created
+  # control-plane-side by aws_eks_pod_identity_association in
+  # transmission-runtime, keyed on (namespace, service_account). Do NOT create
+  # an association for this one: a chat shell has no reason to hold an AWS
+  # identity. With no association the SA simply has no AWS rights, which is the
+  # correct posture. (Substrate item #9: a credential is never ambient where it
+  # is not needed.)
+
+# ⚠ INGRESS — THE DECISION THE BRIEF'S §5 ASKS A HUMAN TO MAKE, AND IT IS STILL
+# UNANSWERED (§7 Q1, Raghu's call). Left DISABLED: that is the reversible
+# default and the only option that needs no auth decision. Access is then
+# `kubectl port-forward svc/openwebui 8080:8080 -n transmission`.
+# ⚠ A port-forward is a USABILITY gate, not a security boundary — see the
+# networkPolicy note at the bottom of this file.
+#
+# If Raghu chooses a hostname (the #807 hindsight precedent), the block is:
+#
+#   ingress:
+#     enabled: true
+#     hostname: openwebui.datasci.d-gurus.com
+#     path: /
+#     # ITS OWN ALB GROUP — never `transmission-dashboard`. NOT because a group
+#     # is limited to one hostname (MEASURED false: `mesh` shares that group on
+#     # its own host). The reasons hindsight records: (1) ALB-LEVEL annotations
+#     # must AGREE across every group member — scheme, listen-ports,
+#     # certificate-arn, ssl-redirect — and a disagreement makes the controller
+#     # report a group conflict and STOP RECONCILING the whole group; (2) blast
+#     # radius — a vendor UI misconfiguration must not stall reconciliation for
+#     # turbo, docs, and the mesh webhook front-door.
+#     groupName: transmission-openwebui
+#     # `scheme` NOT set: chart default is `internal`, every CG dev ALB is
+#     # internal, and this must never become internet-facing.
+#     # The ALB (targetType=ip) health-checks pods directly, so this must return
+#     # 200 on 8080 WITHOUT auth. ★ NOW VERIFIED on the pinned amd64 digest
+#     # (2026-08-11, in Docker): `GET /health` => 200, `{"status":true}`, zero
+#     # redirects, no auth — while `/api/v1/auths/` 401s in the same process, so
+#     # the 200 is a real exemption and not an "auth is off" artifact. This is
+#     # NOT hindsight's trap (its `GET /` was a 307, forcing /api/health).
+#     # ⚠ FWIW `GET /` also returns 200 here, but PREFER /health: `/` serves the
+#     # SvelteKit shell, so it would stay 200 even if the backend were sick.
+#     healthcheckPath: /health
+#     # The *.datasci.d-gurus.com wildcard (ISSUED) already covers this host —
+#     # same ARN hindsight uses, no ACM work. Set => HTTPS + 80→443 redirect,
+#     # which matters because any account gate is a password in a form post.
+#     certificateArn: "arn:aws:acm:us-east-1:457497801237:certificate/4e3c9e91-1ac4-4ec2-a4f0-f007b72cd25e"
+#     # ⚠ AND IF YOU ENABLE THIS, ALSO add the VPC/private-subnet CIDR to
+#     # networkPolicy.allowFromCIDRs at the bottom of this file — see the note
+#     # there for why a namespace-only allow would drop ALB traffic.
+# ⇒ ENABLED. Raghu approved a hostname (2026-08-11), with the two facts below in
+# front of him: Open WebUI has no shared-password mode (access = hand-created
+# accounts), and ENABLE_SIGNUP=false does NOT close first-user bootstrap — on an
+# EMPTY database the FIRST signup returns 200 and becomes an ADMIN; only the
+# second 403s. Measured on the pinned digest.
+#
+# ⚠★★ CONSEQUENCE, and it is an ORDERING requirement, not a caveat: whoever
+# reaches this hostname first on the VPN claims admin. The operator account MUST
+# be created before anyone else is told the URL. The brief's §10 step 7
+# ("confirm signup returns 403") is therefore only valid AFTER that account
+# exists — run it as 8b, or it reads as a failure while working correctly.
+ingress:
+  enabled: true
+  hostname: openwebui.datasci.d-gurus.com
+  path: /
+  # Its OWN ALB group, never transmission-dashboard. Not because a group is
+  # one-hostname (measured false — `mesh` shares that group on its own host) but
+  # because ALB-LEVEL annotations must agree across every group member, and a
+  # disagreement makes the controller stop reconciling the WHOLE group. Blast
+  # radius: a vendor UI must not be able to stall turbo, docs, and the mesh
+  # webhook front-door.
+  groupName: transmission-openwebui
+  # `scheme` unset => chart default `internal`. Every CG dev ALB is internal;
+  # this must never become internet-facing.
+  # /health, not `/`: verified 200 + {"status":true} with no auth and zero
+  # redirects, while /api/v1/auths/ 401s in the same process — so the 200 is a
+  # real exemption, not "auth is off". `/` also 200s but serves the SvelteKit
+  # shell, so it would stay 200 with a sick backend.
+  healthcheckPath: /health
+  # The *.datasci.d-gurus.com wildcard (ISSUED) already covers this host — same
+  # ARN hindsight uses, no ACM work. Set => HTTPS + 80->443 redirect, which
+  # matters because the account gate is a password in a form post.
+  certificateArn: "arn:aws:acm:us-east-1:457497801237:certificate/4e3c9e91-1ac4-4ec2-a4f0-f007b72cd25e"
+
+# ★ PROBE PATHS — VERIFIED, and the chart defaults are worse than a 404 here.
+#
+# MEASURED 2026-08-11 against the pinned amd64 digest (in Docker, since nothing
+# is deployed yet — so this is verified for THE IMAGE, not yet on the cluster):
+#
+#   $ curl -si http://127.0.0.1:53911/health
+#   HTTP/1.1 200 OK
+#   server: uvicorn
+#   content-type: application/json
+#   {"status":true}
+#
+#   zero redirects (num_redirects=0 with -L), and NO auth — proven to be a real
+#   exemption rather than "auth is off", because /api/v1/auths/ and
+#   /api/v1/users/ both return 401 from the same process at the same moment.
+#
+# ⚠★★ THE CHART DEFAULTS (/health/live, /health/ready, /health/startup) DO NOT
+# 404 HERE — THEY RETURN **200**, AND THAT IS THE TRAP. They fall through to
+# Open WebUI's SvelteKit catch-all: `text/html`, 10,453 bytes, byte-identical to
+# what `/this-path-does-not-exist` and `/health/xyzzy` return. So leaving the
+# defaults in place would produce probes that are PERMANENTLY GREEN AND
+# MEANINGLESS — a liveness probe that can never fire, on any hang, forever.
+# ⇒ This is a SHARPER failure than the CrashLoopBackOff the brief predicted: a
+#   404 fails loudly on first deploy; a false-healthy 200 fails silently for the
+#   life of the release. The paths below MUST be set explicitly.
+#
+# Only `path` is overridden; `enabled: true` is inherited from chart/values.yaml.
+#
+# startup: 60 * 5s = 5 minutes. Budget is the first image pull on a node plus
+# Alembic creating ~43 tables on first boot. (Local SQLite boot to /health 200
+# was ~36s; Aurora + 43 tables is the unmeasured part — hence the wide budget.)
+# Liveness does not start counting until startup passes.
+probes:
+  liveness:
+    path: /health
+    initialDelaySeconds: 20
+    periodSeconds: 15
+    timeoutSeconds: 5
+    failureThreshold: 5
+  readiness:
+    path: /health
+    initialDelaySeconds: 15
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 5
+  startup:
+    path: /health
+    initialDelaySeconds: 20
+    periodSeconds: 5
+    timeoutSeconds: 5
+    failureThreshold: 60
+
+env:
+  # ══════════════════════════════════════════════════════════════════════════
+  # 1. ★★ THE LOAD-BEARING FLAG. Without it, EVERY switch below this line is a
+  #    NO-OP on an already-installed instance, and `helm upgrade` CANNOT tighten
+  #    the posture — the DB wins and the values file lies.
+  #
+  #    Enforced at models/config.py:138-146 (Config.get returns the env default
+  #    and never opens a DB session). MEASURED on a seeded DB whose config rows
+  #    said the opposite: 38 tools -> 13, and `memories.enable = true` in the DB
+  #    while the memory routes 404'd anyway. 7/7 conflicting rows obeyed env.
+  #    Boots clean, 0 error lines.
+  #
+  #    ⚠ THE GENERAL RULE THIS CREATES: anything Open WebUI would normally
+  #    establish by WRITING config at runtime must be RESTATED here as env,
+  #    because that write no longer sticks. ENABLE_SIGNUP below is the case that
+  #    bites (fail-OPEN if forgotten).
+  # ══════════════════════════════════════════════════════════════════════════
+  - name: ENABLE_PERSISTENT_CONFIG
+    value: "false"
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # 2. ★★ ZERO INJECTED TOOLS — declarative, and it replaces a per-model DB row.
+  #    utils/models.py:314-330 applies this metadata to EVERY discovered model
+  #    (models/config.py:33 maps `models.default_metadata` to this env var).
+  #    MEASURED: the `tools` key is ABSENT from the outbound body — not `[]`,
+  #    absent — body 23,407 -> ~183 bytes, with public.model EMPTY before and
+  #    after. Set BOTH keys: `builtin_tools` is what kills the 13-tool env floor
+  #    (time/knowledge/chats/tasks have NO global env gate in the code at all).
+  #
+  #    ⚠ JSON-IN-YAML-IN-A-CONFIGMAP — the one value in this file whose
+  #    QUOTING is load-bearing. chart/templates/configmap.yaml renders every
+  #    `env` entry as `{{ .name }}: {{ .value | quote }}`, so this JSON makes two
+  #    hops. VERIFIED 2026-08-11 by `helm template` + parsing the rendered
+  #    ConfigMap value with a JSON parser: it round-trips byte-identical and
+  #    parses to capabilities.builtin_tools=false, capabilities.memory=false.
+  #    ⇒ If you edit this line, RE-RUN THAT CHECK. A mangled value here fails
+  #      SILENTLY — the suppression simply stops happening, with no error.
+  #
+  #    WHY THIS MATTERS AT ALL: 34-41 unrequested tools were measured advertised
+  #    to our agent, including delete_memory, write_note, create_calendar_event,
+  #    and delegate_task (Open WebUI spawning its OWN subagents against our
+  #    endpoint). ruling-ask-deepagents-parity.md §3b makes a tool-exclusion
+  #    floor MANDATORY, and the core Architect ruled: zero, or no agent behind
+  #    it. Env-only suppression bottoming out at 13 (including view_chat, which
+  #    reads the user's OTHER conversations) does NOT satisfy the floor.
+  #
+  #    ⚠★★ DO NOT READ THIS LINE AS "THE VENDOR ENFORCES ZERO TOOLS." IT DOES
+  #    NOT. Two measured holes:
+  #      (a) A config WRITE is a silent no-op (models/config.py:195-205 mutates
+  #          in-memory DEFAULTS). ONE unrelated admin POST nulled this and the
+  #          injected tools came back 0 -> 13, with NO error and NO restart. It
+  #          self-heals on the next restart.
+  #      (b) VERIFIED IN CODE (utils/models.py:325-329, their own comment
+  #          "Per-model overrides take precedence over global defaults";
+  #          `meta['capabilities'] = {**value, **existing}`): this is a DEFAULT,
+  #          not a CEILING. A public.model row setting builtin_tools:true would
+  #          override it. Not exercised — public.model was empty throughout.
+  #    ⇒ THE REAL ENFORCEMENT IS OURS: mesh/harnesses/deepagents.py:105-127
+  #    binds tools at graph-compile time, server-side, upstream of anything the
+  #    vendor can say. Precedent already proven at
+  #    services/mesh/app/api/routes/ask_agui.py:68-88 — a client-supplied
+  #    `tools` array lands in a state channel the compiled graph does not read,
+  #    "never bound onto the ToolNode, never offered to the model."
+  #    ⇒ So this var is PROMPT HYGIENE AND TOKEN WASTE, not a capability
+  #    boundary. It is still a HARD REQUIREMENT per the Architect's ruling, and
+  #    it is still VERIFIED PER DEPLOY (brief §4) precisely because of (a).
+  # ══════════════════════════════════════════════════════════════════════════
+  - name: DEFAULT_MODEL_METADATA
+    value: '{"capabilities":{"builtin_tools":false,"memory":false}}'
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # 3. ⚠★★ MANDATORY, NOT OPTIONAL — AND IT FAILS OPEN IF OMITTED.
+  #    Open WebUI closes signup after the first user by WRITING config
+  #    (auths.py:865 Config.upsert). With ENABLE_PERSISTENT_CONFIG=false that
+  #    write cannot persist, and the env DEFAULT is True (config.py:1623).
+  #    MEASURED: a stranger signup returned HTTP 200 WITHOUT this line, HTTP 403
+  #    WITH it. Bounded (the account lands `pending` and 401s on chat) but it is
+  #    a real fail-open default and it must be in the file.
+  #
+  #    ★ RE-MEASURED 2026-08-11 on the pinned amd64 digest WITH this var set,
+  #    and it refines the claim above — worth knowing before the deploy record
+  #    is written. On an EMPTY database the FIRST signup still returns **200**
+  #    and creates an ADMIN; only the SECOND returns 403 ("You do not have
+  #    permission to access this resource"). So ENABLE_SIGNUP=false does NOT
+  #    close first-user admin bootstrap. That is convenient (it is how the
+  #    operator's one account gets made — brief step 8) but it means:
+  #    ⇒ ⚠ THE FIRST HTTP REQUEST TO A FRESH DEPLOY CAN CLAIM ADMIN. With no
+  #      ingress that window is bounded by cluster credentials + port-forward.
+  #      IF THE INGRESS IS EVER ENABLED ON A FRESH DATABASE, whoever reaches it
+  #      first on the VPN becomes admin. Create the operator account BEFORE
+  #      enabling any ingress, not after.
+  #    ⇒ Consequently the brief's §10 step 7 ("an unauthenticated signup must
+  #      return 403, not 200") is only a valid check AFTER the operator account
+  #      exists. Run it as step 8b, not step 7, or it will read as a failure
+  #      when it is working correctly.
+  # ══════════════════════════════════════════════════════════════════════════
+  - name: ENABLE_SIGNUP
+    value: "false"
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # 4. MEMORY OFF — Recall is the only memory in this platform.
+  #    MEASURED under this exact posture, against a DB row still reading
+  #    `memories.enable = true`: the /api/v1/memories routes 404 even for an
+  #    admin; the executor refuses `add_memory` BY NAME when an agent explicitly
+  #    calls it ("Error: Tool \"add_memory\" not found."); public.memory = 0
+  #    rows. Defence in depth holds on env alone against a hostile stale DB.
+  #    ENABLE_MEMORY_BACKGROUND_REVIEW is the only AUTONOMOUS writer — the one
+  #    feature that would synthesize model-authored memory competing with Recall
+  #    T3, i.e. behind our draft->active curation valve. It is off.
+  # ══════════════════════════════════════════════════════════════════════════
+  - name: ENABLE_MEMORIES
+    value: "false"
+  - name: ENABLE_MEMORY_SYSTEM_CONTEXT
+    value: "false"
+  - name: ENABLE_MEMORY_BACKGROUND_REVIEW
+    value: "false"
+  - name: USER_PERMISSIONS_FEATURES_MEMORIES
+    value: "false"
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # 5. THE CORRELATION KEY + forwarded identity.
+  #    X-OpenWebUI-Chat-Id == public.chat.id, MEASURED stable across every turn
+  #    of every phase and restart-durable ⇒ usable DIRECTLY as a LangGraph
+  #    thread_id. Also yields X-OpenWebUI-User-Email/-Id/-Name/-Role, minted
+  #    server-side from the authenticated session (utils/headers.py:56-62) — a
+  #    forged X-OpenWebUI-User-Email was MEASURED DISCARDED. That non-spoofable
+  #    property is what integrations.md requires: identity frozen server-side
+  #    from the verified initiator, never trusted from the payload.
+  #
+  #    ⚠ THREE CAVEATS, none of which this var fixes:
+  #      (a) UI PATH ONLY. MEASURED ABSENT on POST /api/chat/completions, even
+  #          when passing metadata.chat_id. An API-driven caller gets the 4 user
+  #          headers but NO Chat-Id.
+  #      (b) PLAINTEXT. Only as trustworthy as the network path ⇒ IN-CLUSTER
+  #          ONLY, never across a boundary we do not control. The signed variant
+  #          FORWARD_USER_INFO_HEADER_JWT_SECRET (env.py:936-945, HS256, 300s,
+  #          sends X-OpenWebUI-User-Jwt INSTEAD of the 4 plaintext headers) is
+  #          the better shape and is UNMEASURED by anyone here.
+  #      (c) IT IS AN HMAC SHARED SECRET, NOT AN OKTA-VERIFIABLE ASSERTION. It
+  #          tells our endpoint who Open WebUI BELIEVES the user is. For any
+  #          warehouse/credential path that distinction is load-bearing: this is
+  #          NOT a substitute for the per-user broker.
+  # ══════════════════════════════════════════════════════════════════════════
+  - name: ENABLE_FORWARD_USER_INFO_HEADERS
+    value: "true"
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # 6. DEFENCE IN DEPTH. Strictly redundant given (2) — but they cost nothing,
+  #    and they are what makes the floor 13 instead of 38 if (2) is ever lost to
+  #    the runtime-revert hazard above. ENABLE_SUBAGENTS=false is the one to
+  #    notice: without it `delegate_task` appears, i.e. Open WebUI spawning its
+  #    own subagents against our endpoint.
+  # ══════════════════════════════════════════════════════════════════════════
+  - name: ENABLE_NOTES
+    value: "false"
+  - name: ENABLE_CALENDAR
+    value: "false"
+  - name: ENABLE_AUTOMATIONS
+    value: "false"
+  - name: ENABLE_CHANNELS
+    value: "false"
+  - name: ENABLE_SUBAGENTS
+    value: "false"
+  - name: ENABLE_CODE_INTERPRETER
+    value: "false"
+  - name: ENABLE_CODE_EXECUTION
+    value: "false"
+  - name: ENABLE_USER_WEBHOOKS
+    value: "false"
+  - name: ENABLE_WEB_SEARCH
+    value: "false"
+  - name: ENABLE_IMAGE_GENERATION
+    value: "false"
+  - name: ENABLE_IMAGE_EDIT
+    value: "false"
+  - name: ENABLE_KB_EXEC
+    value: "false"
+  - name: BYPASS_EMBEDDING_AND_RETRIEVAL
+    value: "true"
+  - name: USER_PERMISSIONS_FEATURES_NOTES
+    value: "false"
+  - name: USER_PERMISSIONS_FEATURES_CALENDAR
+    value: "false"
+  - name: USER_PERMISSIONS_FEATURES_AUTOMATIONS
+    value: "false"
+  - name: USER_PERMISSIONS_FEATURES_CHANNELS
+    value: "false"
+  - name: USER_PERMISSIONS_FEATURES_CODE_INTERPRETER
+    value: "false"
+  - name: USER_PERMISSIONS_FEATURES_WEB_SEARCH
+    value: "false"
+  - name: USER_PERMISSIONS_FEATURES_IMAGE_GENERATION
+    value: "false"
+  - name: USER_PERMISSIONS_FEATURES_USER_WEBHOOKS
+    value: "false"
+  # ⚠ Noted as NOT enforced against admins in the source read — belt only.
+  - name: USER_PERMISSIONS_WORKSPACE_KNOWLEDGE_ACCESS
+    value: "false"
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # 7. ⚠ BLAST-RADIUS CAP on the measured re-execution hazard. Stage 0 MEASURED
+  #    ONE `delta.tool_calls` chunk from upstream producing 257 upstream POSTs
+  #    and 513 messages from a single user message. Our shim must never emit
+  #    delta.tool_calls toward Open WebUI (the proven prototype instead streams
+  #    `<details type="tool_calls">` as CONTENT — see brief §6, and note that
+  #    seam is an HTML-in-markdown convention with NO versioned schema, i.e. a
+  #    carried coupling risk, not a solved problem). This var is the belt.
+  # ══════════════════════════════════════════════════════════════════════════
+  - name: CHAT_RESPONSE_MAX_TOOL_CALL_ITERATIONS
+    value: "1"
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # 8. WHERE IT SENDS TRAFFIC. ★ NOW LIVE — the endpoint exists and is gated.
+  #    This block previously said "there is no such service, left commented so
+  #    the file cannot ship a URL that 404s." That is STALE on both counts:
+  #      - The endpoint EXISTS. services/mesh/app/api/routes/chat_completions.py
+  #        serves GET /v1/models + POST /v1/chat/completions on the `mesh`
+  #        service (R1), behind `LyraHarness` — not a separate "shim" service.
+  #        So the target is mesh itself (service.name=mesh, port 8000 —
+  #        chart/values/mesh-dev.yaml), not a `<shim-svc>` still to be built.
+  #      - It is GATED. #839 added `_verify_bearer` (hmac.compare_digest, fails
+  #        CLOSED when its secret is unset) to BOTH routes, verified BEFORE any
+  #        X-OpenWebUI-* header is read. Before #839 those routes were live with
+  #        zero enforce()/Depends().
+  #
+  #    ⚠★★ THE ORDER THIS WAS TURNED ON IS A SECURITY PROPERTY, not a
+  #    preference. While this value stayed commented out, nothing in the cluster
+  #    routed to /v1/*, so the ungated-endpoint gap was theoretical. Setting it
+  #    is the single action that makes that path live. So mesh was gated AND the
+  #    401/401/200 triad was proven against the running pod BEFORE this line was
+  #    uncommented — never the reverse. Anyone re-pointing this value at a new
+  #    backend owes the same order: prove the gate, then point the UI.
+  #
+  #    In-cluster DNS is REQUIRED, not preferred: caveat 5(b) above makes the
+  #    plaintext X-OpenWebUI-* identity headers only as trustworthy as the
+  #    network path, and NetworkPolicy is NOT enforced on this cluster, so the
+  #    bearer below — not the network — is what actually authenticates the call.
+  - name: OPENAI_API_BASE_URL
+    value: http://mesh.transmission.svc.cluster.local:8000/v1
+  #    OPENAI_API_KEY -> openwebui-secrets. REQUIRED: an empty key makes Open
+  #    WebUI skip the connection entirely. It is the SAME shared service bearer
+  #    as mesh-secrets' CHAT_COMPLETIONS_BEARER_TOKEN and must be BYTE-IDENTICAL
+  #    to it — a mismatch is a silent, total 401 on every chat turn. Durable copy
+  #    in AWS Secrets Manager `transmission/openwebui/dev/mesh-bearer-token`;
+  #    rotation = SM + BOTH k8s Secrets + BOTH files' secretVersion, one change.
+  #    ⚠ It authenticates the CALLER ("this request came from our Open WebUI"),
+  #    which is what makes the forwarded X-OpenWebUI-User-Email trustworthy as
+  #    ATTRIBUTION again. It does NOT authenticate the end user — Open WebUI
+  #    itself authenticates the human (hand-created accounts, ENABLE_SIGNUP
+  #    false, internal ALB). Two layers, both present; ruled 2026-08-12, per-user
+  #    Transmission Okta on this surface is OUT OF SCOPE, not deferred.
+  #
+  #    ⚠ DO NOT point this at https://litellm.datasci.d-gurus.com as a
+  #    placeholder "so there is something behind it." That is a RAW MODEL
+  #    GATEWAY, not an agent: it would put a naked Bedrock chat surface on the
+  #    cluster with our gateway key, no harness, no HITL gate, no Recall, and no
+  #    tool boundary — a different product than the one being asked for, with a
+  #    worse security posture. That option is now MOOT (a real agent endpoint
+  #    exists above), but the reasoning is kept because it applies to any future
+  #    "just give it something to talk to" shortcut.
+  # ══════════════════════════════════════════════════════════════════════════
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # 9. ⚠★★ FOUR HIDDEN AGENT-LOOP CALLS PER CONVERSATION. Measured IN THE POD:
+  #    all four default True, and both file caps default None.
+  #
+  #      python -c "from open_webui.config import ..."   (in openwebui-84dc65b75d)
+  #        TITLE True · TAGS True · FOLLOW_UP True · RETRIEVAL_QUERY True
+  #        FILE_MAX_SIZE None · FILE_MAX_COUNT None
+  #
+  #    `get_task_model_id` falls back to the DEFAULT model when TASK_MODEL is
+  #    empty, so every one of those four would hit Lyra — a full 16-tool agent
+  #    run each, invisible to the user, on top of the turn they asked for.
+  #
+  #    ⚠ And they do not merely cost: the title prompt demands "solely the JSON
+  #    object, without any markdown code fences ... as this will cause direct
+  #    parsing failure". An agent loop emits prose, so it FAILS THE PARSE AFTER
+  #    PAYING FOR THE RUN. That is a mystery cost plus a mystery error, and it
+  #    would surface first in a demo.
+  #
+  #    ⇒ Off. If titles/tags are wanted later, the right fix is
+  #    TASK_MODEL_EXTERNAL pointed at a plain cheap model — never the agent.
+  - name: ENABLE_TITLE_GENERATION
+    value: "false"
+  - name: ENABLE_TAGS_GENERATION
+    value: "false"
+  - name: ENABLE_FOLLOW_UP_GENERATION
+    value: "false"
+  - name: ENABLE_RETRIEVAL_QUERY_GENERATION
+    value: "false"
+
+  # ⚠ Upload caps. Both default None, and enforcement reads `if max_size and ...`
+  # — so an unset value SKIPS THE CHECK ENTIRELY rather than applying a default.
+  # Combined with BYPASS_EMBEDDING_AND_RETRIEVAL=true (which injects the FULL
+  # file text rather than building an index), one large upload becomes one
+  # enormous prompt to our endpoint. 10 MB and 5 files are a starting point for a
+  # handful of DS users, not a measured limit — revisit when real usage exists.
+  - name: RAG_FILE_MAX_SIZE
+    value: "10485760"
+  - name: RAG_FILE_MAX_COUNT
+    value: "5"
+
+  # ⚠ Tool servers — closed by the VENDOR's default, not by us, which is exactly
+  # the kind of "control" that silently becomes false on a version bump. v0.11.0
+  # does support MCP (`tools.py:127`), and a direct tool server is invoked from
+  # OPEN WEBUI'S SERVER — so its credentials would live in the chat tier, not
+  # ours. That inverts the credential model (substrate item #9: never ambient
+  # where it isn't needed). Set explicitly so the posture is ours, per the
+  # standing rule that a security-relevant default is not a control until we own
+  # it.
+  - name: TOOL_SERVER_CONNECTIONS
+    value: "[]"
+  - name: USER_PERMISSIONS_FEATURES_DIRECT_TOOL_SERVERS
+    value: "false"
+  - name: USER_PERMISSIONS_WORKSPACE_TOOLS_ACCESS
+    value: "false"
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # 10. Observability — same shape as every other service here.
+  # ══════════════════════════════════════════════════════════════════════════
+  - name: OTEL_EXPORTER_OTLP_ENDPOINT
+    value: http://otel-collector.observability:4318
+  - name: OTEL_SERVICE_NAME
+    value: openwebui
+
+# Its OWN Secret — NEVER mesh-secrets. templates/deployment.yaml consumes this
+# as `envFrom.secretRef`, which injects the ENTIRE Secret as environment; there
+# is NO key subsetting. mesh-secrets here would hand a third-party image
+# GH_PAT, GH_WRITE_PAT, SLACK_*, SNOWFLAKE_*, LANGFUSE_* and E2B_API_KEY, none
+# of which it uses. Substrate item #9: a write credential is never ambient where
+# it is not needed. Same shape as hindsight-secrets, dashboard-backend-secrets
+# and edge-backend-secrets — the convention, not an exception.
+# Key names and the AWS paths behind them: brief §3.
+# ★ THIS SECRET NOW EXISTS (created 2026-08-11; extended 2026-08-13). Three keys,
+# all Manager-owned material:
+#   - DATABASE_URL      dedicated `openwebui` database on the Recall cluster.
+#                       AWS SM `transmission/openwebui/dev/db/owner`. ⚠ The DB
+#                       password is a substrate exception with its own approval
+#                       (brief §7 Q3), not hindsight's coattails.
+#   - WEBUI_SECRET_KEY  session-signing key. AWS SM
+#                       `transmission/openwebui/dev/webui-secret-key`.
+#   - OPENAI_API_KEY    ★ the outbound bearer for the mesh /v1/* seam (added
+#                       2026-08-13). BYTE-IDENTICAL to mesh-secrets'
+#                       CHAT_COMPLETIONS_BEARER_TOKEN; AWS SM
+#                       `transmission/openwebui/dev/mesh-bearer-token`. See
+#                       section 8 above for what it does and does not prove.
+# The deploy fails without DATABASE_URL; it silently skips the model connection
+# without OPENAI_API_KEY (an empty key makes Open WebUI not even try).
+envFromSecret: openwebui-secrets
+
+# ⚠ BUMP THIS ON EVERY ROTATION of openwebui-secrets, in the same PR as the
+# rotation. `envFrom.secretRef` values are read once at pod start and Helm
+# cannot hash a Secret it does not render — so rotating a key and running
+# `helm upgrade` with unchanged values renders a BYTE-IDENTICAL pod template,
+# creates no new ReplicaSet, and leaves the pod on the OLD credential while
+# `helm upgrade` exits 0 reporting success. That was caught live on this cluster
+# on 2026-08-11 (chart/values.yaml:151-185). Any change to this string works —
+# it is hashed into a pod annotation, not parsed.
+# The unconditional backstop remains `kubectl rollout restart deploy/openwebui`.
+secretVersion: "2026-08-13-openai-api-key-bearer"
+
+# ⚠ SIZED BY ANALOGY, NOT MEASURED. Open WebUI is a Python backend serving a
+# built SvelteKit frontend. BYPASS_EMBEDDING_AND_RETRIEVAL=true means no local
+# embedding model is loaded in-pod, which is the difference between this and a
+# multi-GB footprint. The limits are a starting point for a handful of DS users
+# on a dev cluster; watch actual usage and adjust. Nodes allocate ~15Gi / 3920m
+# each, so this fits alongside mesh and hindsight.
+resources:
+  requests:
+    cpu: 100m
+    memory: 512Mi
+  limits:
+    cpu: "1"
+    memory: 2Gi
+
+# Default-deny ingress on 8080 from the namespace.
+# ⚠ DECLARATIVE INTENT ONLY — NOT A CONTROL TODAY. The cluster's
+# aws-eks-nodeagent runs --enable-network-policy=false, so nothing enforces
+# this. It never loosens anything and becomes load-bearing if enforcement is
+# turned on. Do not cite it as a compensating control anywhere.
+# ⚠ allowFromCIDRs is EMPTY and the ingress IS now enabled, so this is a LATENT
+# GAP rather than a non-question: with targetType=ip the ALB dials pod IPs from
+# VPC subnets, not from an allowed namespace, so a namespace-only allow would
+# drop ALB traffic the day enforcement is switched on. Harmless today only
+# because nothing enforces NetworkPolicy at all.
+# Left empty DELIBERATELY, to match every other ingress-fronted service here —
+# dashboard-backend, dashboard-frontend, edge-backend and hindsight all carry the
+# identical empty list and the identical debt. Fixing it for this one vendor
+# service would diverge one file from four without closing the gap anywhere else;
+# it belongs to whoever turns enforcement on, as one change across all of them.
+networkPolicy:
+  enabled: true
+  allowFromNamespaces:
+    - transmission

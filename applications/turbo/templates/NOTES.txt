@@ -1,0 +1,13 @@
+Turbo chart installed into namespace: {{ .Release.Namespace }}
+
+Workloads:
+  - backend  (turbo-app)      Deployment + Service + TargetGroupBinding  :8080
+  - frontend (turbo-frontend) Deployment + Service + TargetGroupBinding  :80
+
+PREREQUISITES (must exist BEFORE this release serves traffic):
+  1. Namespace {{ .Release.Namespace }} labeled elbv2.k8s.aws/pod-readiness-gate-inject=enabled
+  2. Secrets present: {{ .Values.secrets.coreName }}, {{ .Values.secrets.externalToolsName }}, {{ .Values.secrets.arangoName }}
+     Verify: kubectl -n {{ .Release.Namespace }} get secret {{ .Values.secrets.coreName }} {{ .Values.secrets.externalToolsName }} {{ .Values.secrets.arangoName }}
+  3. Pod Identity associations for ServiceAccounts turbo / turbo-frontend
+
+Backend replicas are pinned to {{ .Values.backend.replicas }} (single-replica poller constraint).

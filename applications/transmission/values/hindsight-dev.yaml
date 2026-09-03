@@ -1,0 +1,576 @@
+# Hindsight — the Recall retrieval-engine backend (read side) — dev values.
+#
+# Layered over chart/values.yaml by:
+#   helm upgrade --install hindsight chart/ \
+#     --namespace transmission \
+#     --values chart/values/hindsight-dev.yaml --wait --atomic
+#
+# DEPLOY CONVENTION (deploy-convention-release-name trap): the Helm release name
+# == service.name == this file's stem == `hindsight`.
+#
+# WHAT THIS IS. A third-party vendor image (Vectorize's Hindsight) adopted as a
+# BACKEND under our own LearningsReader/LearningsWriter Protocols — see
+# docs/architecture/ruling-hindsight-vendor-memory.md. It is NOT in the run path,
+# NOT a dependency of any flow, and nothing reads it in production: the consuming
+# adapter lands later behind an off-by-default flag. If this pod is down, nothing
+# breaks. That is deliberate — it is what makes the slice reversible.
+#
+# NOT wired into the deploy.yml services matrix: that matrix builds an image from
+# a Dockerfile in this repo and pushes it to our ECR. This service runs a vendor
+# image we do not build, so there is nothing for CI to build or tag. It installs
+# by an explicit `helm upgrade --install` (the pipeline is dormant anyway —
+# mesh-deploy-pipeline-dormant), and `image.tag` is pinned HERE rather than by
+# `--set image.tag=<sha>` like every first-party service.
+service:
+  name: hindsight
+  # 8888 = the API (the dataplane). This is the port `mesh` calls, and it stays
+  # the primary `service.port` — the probes below and the NetworkPolicy's first
+  # allow are keyed off it.
+  port: 8888
+  # 9999 = the vendor's Control Plane console (a Next.js app the same image
+  # starts; enabled below, gated by an access key). It now has a real Service
+  # port so the Ingress can front it — this replaces the previous
+  # `kubectl port-forward`-only access.
+  #
+  # ONE POD, TWO PORTS — deliberately, not a second Helm release. A second
+  # release would either run a whole second 4.2GB vendor pod with a DUPLICATE
+  # HINDSIGHT_API_WORKER_ID (the orphaned-task bug that env var exists to
+  # prevent), or, keeping `service.name: hindsight`, render a Service whose
+  # `app.kubernetes.io/instance` label matches no pod — zero endpoints. See
+  # `service.extraPorts` in chart/values.yaml.
+  extraPorts:
+    - name: console
+      port: 9999
+
+image:
+  # A THIRD-PARTY registry, not our ECR — the only such image in this chart.
+  # Pinned to the 0.9.0 release tag (NOT `latest`): a vendor image that
+  # self-migrates its own schema on boot must not change under us silently.
+  # NOTE the tag is `0.9.0`, with no `v` prefix — ghcr has no `v0.9.0`.
+  # The multi-arch index at 0.9.0 resolves to
+  # sha256:efc2eced62374c78ae9c19c21f1447a23525d07be00d19ca3dafb67effbf649e on
+  # linux/amd64 (both our nodes are amd64). ~1.5GB compressed / ~4.2GB unpacked
+  # over 21 layers, so the first pull on a node is slow — the startup probe
+  # budget below accounts for it.
+  repository: ghcr.io/vectorize-io/hindsight
+  tag: 0.9.0
+  pullPolicy: IfNotPresent
+
+# One pod. `worker.enabled` is irrelevant — the API process runs its own worker
+# in-process, so a second replica would mean two workers polling one schema.
+replicas:
+  min: 1
+  max: 1
+hpa:
+  enabled: false
+
+serviceAccount:
+  create: true
+  name: hindsight
+
+# AN INGRESS, on its own hostname, fronting the CONSOLE only.
+#
+# This file previously read "NO ingress, deliberately" — that is no longer true,
+# and the reason it changed is a decision, not a discovery: Raghu asked for the
+# operator console on a hostname, having been shown the alternatives
+# (port-forward-only, or Okta first). Recorded here so nobody reads the change as
+# drift.
+#
+# WHAT THIS COSTS, stated plainly: HINDSIGHT_CP_ACCESS_KEY — one shared password,
+# with no rotation — is now the ONLY thing between any human on the VPN and the
+# console, where it was previously also behind needing cluster credentials and a
+# port-forward. The ALB is `internal`, so the exposure is VPC/VPN-wide, not
+# internet-wide. An Okta-fronted ingress (the dashboard already does Okta) is the
+# right end state and is NOT built here; a shared password is not the intended
+# destination.
+#
+# 9999, NEVER 8888. `servicePortName: console` points the ALB at the console,
+# whose gate is a browser session. 8888 is the dataplane API, authenticated by a
+# Bearer token our services hold — putting that on a hostname would place a
+# token-authenticated API where a human can reach it, and the console already
+# proxies everything a human needs (it is itself an 8888 client, via
+# HINDSIGHT_CP_DATAPLANE_API_KEY).
+ingress:
+  enabled: true
+  hostname: hindsight.datasci.d-gurus.com
+  path: /
+  # Route to the `console` Service port (9999), not the default `service.port`.
+  servicePortName: console
+  # Its OWN ALB group, NOT `transmission-dashboard`. Same shape as
+  # `transmission-edge` (chart/values/edge-backend-dev.yaml): own host, own group.
+  # Sole member, so groupOrder is not contended — the chart default (10) stands.
+  #
+  # The reason is NOT that a group is limited to one hostname — MEASURED, it is
+  # not: `mesh` sits in group `transmission-dashboard` on mesh.datasci.d-gurus.com
+  # alongside turbo's three services, and external-dns records each Ingress
+  # hostname against the shared ALB without thrashing anything. An earlier draft of
+  # this comment claimed otherwise. The real reasons are:
+  #  1. ALB-LEVEL annotations must AGREE across every group member (chart/README.md
+  #     — scheme, listen-ports, certificate-arn and ssl-redirect apply to the whole
+  #     ALB, and a disagreement makes the controller report a group conflict and
+  #     STOP RECONCILING the group). Joining the dashboard's group would couple
+  #     this vendor console's TLS and scheme to the dashboard's.
+  #  2. Blast radius: a misconfiguration on a vendor console should not be able to
+  #     stall reconciliation for turbo, docs, and the mesh webhook front-door.
+  groupName: transmission-hindsight
+  # `scheme` is NOT set: the chart default is `internal`, and every CG dev ALB is
+  # internal. This must not become internet-facing.
+  #
+  # The ALB (targetType=ip) health-checks pods directly, so this must be a path
+  # that returns 200 on 9999 WITHOUT auth. `/` is NOT public — the console
+  # middleware 307s it to /login (measured in-pod: `GET /` => 307), which would
+  # leave the target group unhealthy or flapping. `/api/health` IS on the
+  # middleware public allowlist (control-plane/src/middleware.ts:11-21) and is a
+  # CONSOLE route, not the API's `/health` on 8888 — measured in-pod as 200 with
+  # {"status":"ok","service":"hindsight-control-plane",...}. Note it also reports
+  # the dataplane connection, so an unhealthy target means the console cannot
+  # reach 8888 — which is what we want a health check to catch.
+  healthcheckPath: /api/health
+  # The *.datasci.d-gurus.com + datasci.d-gurus.com wildcard (ISSUED) already
+  # covers this host, so no ACM work. With it set the template gives HTTPS plus
+  # an 80->443 redirect; without it the ALB is HTTP-only, and a shared console
+  # password in cleartext inside the VPC is avoidable. This ALB group's only
+  # member, so there is no cross-service cert-mismatch concern (unlike the
+  # dashboard pair, where the arn must match byte-for-byte).
+  certificateArn: "arn:aws:acm:us-east-1:457497801237:certificate/4e3c9e91-1ac4-4ec2-a4f0-f007b72cd25e"
+
+# /health (api/http.py) verifies DB connectivity and returns 200 healthy /
+# 503 unhealthy. It carries NO auth dependency, so probes work with the API-key
+# tenant extension active. There is no separate /health/live|ready|startup trio,
+# so all three probes point at the same route (chart defaults would 404).
+#
+# startup: 60 * 10s = 10 minutes before the pod is failed. The budget is for the
+# ~4.2GB first pull plus 94 Alembic migrations on first boot; liveness does not
+# start counting until the startup probe passes.
+probes:
+  liveness:
+    path: /health
+    initialDelaySeconds: 15
+    periodSeconds: 15
+    timeoutSeconds: 5
+    failureThreshold: 5
+  readiness:
+    path: /health
+    initialDelaySeconds: 10
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 5
+  startup:
+    path: /health
+    initialDelaySeconds: 20
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 60
+
+env:
+  # ── Ports / processes ───────────────────────────────────────────────────────
+  - name: HINDSIGHT_API_HOST
+    value: "0.0.0.0"
+  - name: HINDSIGHT_API_PORT
+    value: "8888"
+  # The Control Plane — the vendor's operator console — runs on 9999
+  # (start-all.sh:261-267 launches `node server.js` when this is true; the image
+  # default is already true, Dockerfile:426).
+  #
+  # An earlier version of this comment called it an "unauthenticated HTML
+  # surface." That was OUR unset key, not the vendor's design. The gate is
+  # `control-plane/src/middleware.ts`:
+  #   :26     const accessKey = process.env.HINDSIGHT_CP_ACCESS_KEY
+  #   :31-33  if (!accessKey) return NextResponse.next()   <- unset ⇒ WIDE OPEN
+  #   :40-52  API routes: bad/absent session cookie ⇒ 401
+  #   :59-74  page routes: non-public path ⇒ redirect to /login?returnTo=…
+  # Public allowlist (:11-21) is /login, /api/auth/, /api/health, /api/version,
+  # and static assets. No data path is public.
+  #
+  # ⇒ HINDSIGHT_CP_ACCESS_KEY (in hindsight-secrets) is the ENTIRE safety of this
+  # setting, and its failure mode is silent: an unset or empty key does not error,
+  # it serves everything. So it is verified by REQUEST, not by reading this file —
+  # `GET /` must 307 to /login and `GET /api/banks` must 401.
+  #
+  # That key is deliberately NOT HINDSIGHT_API_TENANT_API_KEY: the tenant key is
+  # our agent's programmatic credential, this one is a human console password.
+  # Sharing them would make rotating one force the other.
+  #
+  # 9999 IS NOW PUBLISHED: `service.extraPorts` declares the containerPort and a
+  # Service port named `console`, and `ingress` fronts it on
+  # hindsight.datasci.d-gurus.com. Two earlier claims here are now false and have
+  # been removed rather than left to rot — there is no longer "no containerPort
+  # for 9999" and no longer "no ingress". `kubectl port-forward` still works; it
+  # is no longer the only way in.
+  #
+  # What did NOT change is that declaring a port was never the control: NOT
+  # declaring 9999 never stopped the process binding it, and the cluster's VPC CNI
+  # runs --enable-network-policy=false, so our NetworkPolicy is declarative intent
+  # and anything in the VPC could already reach 9999 on the pod IP. The access key
+  # was therefore already the real control, and the ingress does not weaken a
+  # control that never existed — it widens the population that can find the port
+  # from "someone who knows a pod IP" to "anyone on the VPN who can resolve a
+  # hostname". See the ingress block for the honest cost, and for why Okta is the
+  # next step.
+  # The console is a SEPARATE client of the API, and its own login does not
+  # authenticate it downstream. Measured: with CP_ACCESS_KEY set and a valid
+  # session cookie, `GET /api/banks` still 401s, because the CP forwards
+  # `Authorization: Bearer $HINDSIGHT_CP_DATAPLANE_API_KEY` and that was unset
+  # (control-plane/src/lib/hindsight-client.ts:15,22-24 — the header is omitted
+  # entirely when the var is empty, so the API's own tenant gate rejects it).
+  #
+  # So there are TWO independent gates in front of console data, and both must be
+  # satisfied: CP_ACCESS_KEY (is this human allowed in the console) and this key
+  # (is the console allowed to read the API). This one legitimately IS a copy of
+  # the tenant key — here the console is a programmatic API client, which is what
+  # that credential is for, and it is NOT a substitute for CP_ACCESS_KEY.
+  #
+  # It lives in hindsight-secrets, not in this list: chart/templates/configmap.yaml
+  # renders every `env` entry into a plainly-readable ConfigMap, and the chart has
+  # no `valueFrom`/`secretKeyRef` support — so a secret-valued env var under a
+  # different name can only arrive as its own Secret key.
+  - name: HINDSIGHT_ENABLE_CP
+    value: "true"
+  - name: HINDSIGHT_ENABLE_API
+    value: "true"
+  # A CONSTANT worker id. Default is None (config.py:1260), which falls back to
+  # the pod hostname — and that changes on every recreate, so tasks left in
+  # `processing` under the old hostname are never recovered. A fixed string fixes
+  # that without a StatefulSet: the vendor's concern is an orphaned id, not
+  # per-replica uniqueness, and we run exactly one replica with no plan for more.
+  # If the vendor ever requires uniqueness per replica, this needs revisiting.
+  - name: HINDSIGHT_API_WORKER_ID
+    value: hindsight-dev-0
+
+  # ── Database ────────────────────────────────────────────────────────────────
+  # A SEPARATE DATABASE on the existing transmission-recall-dev cluster, not a
+  # schema in transmission_recall. migrations.py:83-97 holds
+  # `DROP EXTENSION vector CASCADE` in its boot path, to relocate pgvector when
+  # it is not in `public`. DATABASE_SCHEMA scopes tables; it does NOT scope
+  # extensions. In a shared database that statement would drop every dependent
+  # vector column and HNSW index in memory.*. Our `vector` is in `public` today
+  # so the safe branch runs — but that safety is incidental (our own
+  # 20260527000001_initial_memory_schema.sql:5 is a bare CREATE EXTENSION with
+  # no schema clause), and the failure mode is silent structural loss, not an
+  # error. A separate database makes the question unaskable.
+  #
+  # ONE database user, owning the schema. Both URLs point at the same role.
+  #
+  # There is no DML/DDL seam here, and an earlier version of this comment claimed
+  # one. The vendor performs DDL on whatever connection the caller passes, and on
+  # the retain path that is the runtime pool: creating a bank issues
+  # `CREATE INDEX ... ON memory_units` (engine/db/ops_postgresql.py:864) and
+  # deleting one issues `DROP INDEX CONCURRENTLY` (:885). Both require table
+  # ownership. So a DML-only runtime role cannot create a bank — measured, as a
+  # 500 `must be owner of table memory_units` on the first retain.
+  # MIGRATION_DATABASE_URL is threaded into Alembic and nowhere else
+  # (migrations.py:1130-1137 passes database_url, never migration_database_url),
+  # which is why the boot-time dimension ALTER failed the same way.
+  #
+  # `CREATE INDEX` and `DROP INDEX` are the ONLY DDL in that ops layer, both in
+  # bank lifecycle — that bound is what made one user the answer rather than a
+  # guess. Two keys remain because the vendor reads both; they are not different
+  # credentials and nothing should reason as though they were.
+  #
+  # ⇒ Do NOT reintroduce a second role to describe a boundary the vendor does not
+  # model. A control we cannot name the enforcing code for does not go in a
+  # comment.
+  #
+  # What bounds this credential is the DATABASE boundary, not the user model.
+  # Recall's own datacl carries an implicit grant to PUBLIC (`=Tc/…`, i.e. CONNECT
+  # + TEMPORARY for every role, including one created tomorrow), so a
+  # `REVOKE ALL ON DATABASE transmission_recall FROM <this user>` is a NO-OP: the
+  # user would connect anyway and still hold USAGE on schema `public`. Revoking
+  # from PUBLIC instead would touch all six existing Recall roles — shared state,
+  # and unnecessary once this database is separate. So this user is expected to be
+  # ABLE to connect to Recall; what it cannot do is reach anything there, because
+  # it is granted nothing on memory.* or langgraph.* (measured: CONNECT succeeds,
+  # both schemas permission-denied).
+  #
+  # Both are full URLs containing a password, so they live in the Secret
+  # (envFromSecret below), NOT here: chart/templates/configmap.yaml renders every
+  # `env` entry into a plainly-readable ConfigMap.
+  #   HINDSIGHT_API_DATABASE_URL            <- the schema owner
+  #   HINDSIGHT_API_MIGRATION_DATABASE_URL  <- the same role, same credential
+  #
+  # Kept even with a separate database — belt and braces, and it is the
+  # configuration stage 0 actually verified (119 relations + alembic_version all
+  # landed inside this schema).
+  - name: HINDSIGHT_API_DATABASE_SCHEMA
+    value: hindsight
+  # It self-migrates 94 Alembic migrations on boot; that is how the schema gets
+  # created. Contained by the separate database — the only containment here.
+  - name: HINDSIGHT_API_RUN_MIGRATIONS_ON_STARTUP
+    value: "true"
+
+  # ── Embeddings — via our LiteLLM gateway ────────────────────────────────────
+  # `openai` here means their OpenAI-COMPATIBLE provider; LiteLLM speaks that
+  # protocol. The default is `local`, which downloads torch weights in-pod.
+  #
+  # ONE-WAY ON FIRST BOOT: there is no dimension env var. The dimension is
+  # derived from the configured model, and migrations.py:392-430 only ALTERs the
+  # embedding column WHILE THE TABLE IS EMPTY — it raises once rows exist. Stage
+  # 0 measured cohere-embed-v4 through this gateway at 1024, matching our
+  # memory.learning.embedding vector(1024). Changing the model after rows land
+  # is a drop-and-reload, so this must be right on boot 1.
+  - name: HINDSIGHT_API_EMBEDDINGS_PROVIDER
+    value: openai
+  - name: HINDSIGHT_API_EMBEDDINGS_OPENAI_MODEL
+    value: cohere-embed-v4
+  - name: HINDSIGHT_API_EMBEDDINGS_OPENAI_BASE_URL
+    value: https://litellm.datasci.d-gurus.com/v1
+  # HINDSIGHT_API_EMBEDDINGS_OPENAI_API_KEY -> hindsight-secrets (the LiteLLM key)
+
+  # ── LLM: ON, through our LiteLLM gateway — the synthesis path ───────────────
+  # This read `none` until 2026-08-12, and the change is a decision, not drift:
+  # ruling-distillation-to-hindsight.md (#815) ports distillation forward onto the
+  # vendor's synthesis, so the engine now needs a model. The `none` reasoning was
+  # load-bearing, so what it bought and what replaces it is recorded rather than
+  # deleted.
+  #
+  # `openai` means their OpenAI-COMPATIBLE provider — the same sense as the
+  # EMBEDDINGS block above, and NOT the `litellm` provider value, which is their
+  # SDK rather than a proxy (config.py:148).
+  #
+  # ⚠ THE LLM VARS ARE FLAT — no `_OPENAI_` infix, unlike every EMBEDDINGS var in
+  # this file. The fields are `llm_provider` / `llm_model` / `llm_base_url` /
+  # `llm_api_key` (config.py:2062-2065, env normalization :108). So
+  # `HINDSIGHT_API_LLM_OPENAI_MODEL` DOES NOT EXIST and would be SILENTLY IGNORED,
+  # leaving the pod on the `gpt-4o-mini` default against a gateway that serves no
+  # such model — a failure on every synthesis call, not a boot error. Do not
+  # "regularize" these names against the embeddings block.
+  #
+  # WHAT `none` BOUGHT, AND HOW IT IS REPLACED. `none` was a STRUCTURAL guarantee
+  # of zero boot egress: memory_engine.py:1293-1294 forces skip_llm_verification,
+  # so there was no startup connection to any host, and llm_wrapper.py:259-279
+  # exempted it from needing a key. With a real provider the engine DOES verify at
+  # startup. So the guarantee is now a CONFIGURATION one — the base URL below —
+  # which means it must be verified by observation on every roll, not assumed from
+  # this file.
+  #
+  # ⇒ HOW TO VERIFY IT. The obvious grep proves nothing:
+  #   `Verifying connection: {provider}/{model}` (providers/openai_compatible_llm.py:690)
+  #   carries NO HOST. The host is on the PRECEDING line —
+  #     "OpenAI-compatible client initialized: provider=…, model=…, base_url=…"
+  #     (providers/openai_compatible_llm.py:663-664)
+  #   ⇒ grep THAT and confirm `base_url` is our gateway, then `Connection verified:`
+  #   as the success line. ⚠ A FAILED verification is a WARNING and the pod starts
+  #   anyway (engine/memory_engine.py:3266-3273), so neither "Running" nor a green
+  #   `helm upgrade` is evidence about which host was dialled.
+  - name: HINDSIGHT_API_LLM_PROVIDER
+    value: openai
+  # A BARE alias, exactly like cohere-embed-v4 above — the gateway serves bare
+  # names, not `provider/model` paths.
+  #
+  # Chosen as the cheapest CAPABLE chat model the gateway actually serves.
+  # Measured 2026-08-12 against `GET /v1/models`, the full chat set is:
+  # claude-opus-4-7, claude-sonnet-4-6, claude-haiku-4-5, glm-4.7-flash,
+  # qwen3-coder. Synthesis is a bulk, latency-tolerant summarization over short
+  # learning bodies — the haiku tier's job; opus and sonnet cost more per
+  # observation for a task that does not need them, and this is the first thing on
+  # this pod that spends tokens at all (the write path runs at total_tokens 0).
+  #
+  # ⚠ The vendor default is `gpt-4o-mini`, which this gateway does NOT serve, so an
+  # unset or misspelled alias fails on EVERY synthesis call while the pod stays
+  # happily Running. Verified 2026-08-12: `POST /v1/chat/completions` with this
+  # alias through the gateway => HTTP 200.
+  - name: HINDSIGHT_API_LLM_MODEL
+    value: claude-haiku-4-5
+  - name: HINDSIGHT_API_LLM_BASE_URL
+    value: https://litellm.datasci.d-gurus.com/v1
+  # HINDSIGHT_API_LLM_API_KEY -> hindsight-secrets (a COPY of the LiteLLM key).
+  # ⚠ MANDATORY now the provider is not `none`, and its absence is a CRASH-LOOP,
+  # not a degrade: engine/memory_engine.py:1298 raises "LLM API key is required"
+  # and providers/openai_compatible_llm.py:634 raises "API key is required for
+  # openai" (`openai` is not in the exempt set, llm_wrapper.py:259-274). ⇒ The key
+  # and the provider value land TOGETHER or the pod does not boot.
+
+  # ── Retention semantics — what keeps our curation valve intact ──────────────
+  # chunks: store each chunk as-is, no LLM rewrite. This is what lets Hindsight
+  # sit BELOW our valve as a storage engine; stage 0 proved it byte-identical on
+  # real learning bodies including the glyphs.
+  #
+  # ⚠ STAYS `chunks` now that an LLM IS configured above — this is the verbatim
+  # FACT path, and the two write paths are never collapsed: the original fact is
+  # stored byte-verbatim, and synthesis rides ON TOP as observations (where byte
+  # fidelity is correctly not guaranteed, because they are derived). Any
+  # LLM-extraction mode here would put a model between a learning body and its
+  # stored fact, which is the one thing this migration must not do — the verbatim
+  # copy is our auditable provenance.
+  - name: HINDSIGHT_API_RETAIN_EXTRACTION_MODE
+    value: chunks
+  # 8000 chars per chunk, up from the 3000 default (config.py:1134). This must
+  # exceed our longest learning body, because a body split across N chunks CANNOT
+  # BE REASSEMBLED: the vendor's RecursiveCharacterTextSplitter consumes the
+  # separator it breaks on, so no join reconstructs the original. Measured in the
+  # pod against its own chunk_text — a 4041-char body produced two units totalling
+  # 4037 chars, and joining on '', '\n' and '\n\n' all differed from the source.
+  # Since fetch_learnings must return one body per learning, byte-identical, the
+  # only correct option is a chunk size no body reaches.
+  #
+  # Sizing (memory.learning WHERE status='active', measured 2026-08-10):
+  #   total 66 · over_3000 3 · longest 4409 chars · 4445 bytes · 28 multibyte rows
+  # 8000 clears 4409 with ~1.8x headroom. Note bytes > chars: our bodies carry
+  # multibyte glyphs, which is why fidelity is checked with octet_length and md5
+  # over convert_to(body,'UTF8'), never length().
+  #
+  # ⚠ NEW COUPLING, live as of LLM_PROVIDER=openai above:
+  # validate_retain_completion_token_budget (config.py:1546-1559) RAISES at boot
+  # unless HINDSIGHT_API_RETAIN_MAX_COMPLETION_TOKENS is GREATER THAN this value.
+  # That validator returns early while llm_provider == "none" (:1548), so it was
+  # dead code for us until now. It passes today — the default is 64000
+  # (config.py:1133) against 8000 here, ~8x headroom — but the two numbers are now
+  # linked, and violating the relation is a BOOT FAILURE, not a degrade. Raising
+  # this above 64000, or setting that var lower than this, crash-loops the pod.
+  - name: HINDSIGHT_API_RETAIN_CHUNK_SIZE
+    value: "8000"
+  # true: model-authored "observations" MAY now be synthesized. This read "false"
+  # and called itself "the setting that preserves curation" — that description is
+  # SUPERSEDED by #815, which moves the valve from ADMISSION to DISPOSITION rather
+  # than removing it. Three other things preserve curation now, and none of them is
+  # this flag:
+  #   1. mesh/memory/hindsight_store.py:96-100 pins the agent-facing read to
+  #      _FACT_TYPES = ["world"], so synthesized text cannot reach a curated
+  #      surface even with this true. Widening that is S3 work, gated behind the
+  #      suppression filter — it must not be widened to make something work.
+  #   2. AUTO_CONSOLIDATION below stays false, so nothing synthesizes unprompted.
+  #   3. `prefer_observations` is never set anywhere (grepped repo-wide, only a
+  #      docstring mention): set, it would make recall return the model's summary
+  #      INSTEAD OF the curated fact.
+  #
+  # ⚠ NECESSARY, NOT SUFFICIENT — and this is the trap that would make the slice
+  # look shipped while doing nothing. BOTH automatic synthesis triggers require
+  # this AND auto-consolidation: post-retain (engine/memory_engine.py:4259) and the
+  # periodic reconcile (maintenance.py:381). With auto-consolidation false — which
+  # it stays — flipping this alone produces ZERO observations, silently and with no
+  # error. Synthesis happens only when WE invoke
+  # `POST /v1/default/banks/{bank_id}/consolidate`, which is ungated by the auto
+  # flag (api/http.py:7332) and checks only this one
+  # (consolidation/consolidator.py:1118). ⇒ "ENABLE_OBSERVATIONS is true" is not
+  # evidence that anything was synthesized; an observation row is.
+  - name: HINDSIGHT_API_ENABLE_OBSERVATIONS
+    value: "true"
+  # false, and it MUST STAY false — architectural ruling
+  # (ruling-distillation-to-hindsight.md §4), not a tuning knob. It is the TRIGGER
+  # and only the trigger, so turning it off removes no capability: we drive
+  # consolidation explicitly instead (above). What it would add is destructive and
+  # silent — LLM-authored CREATE/UPDATE/DELETE on observations
+  # (consolidation/prompts.py:152, executed consolidator.py:2391-2412) plus a
+  # cosine >= 0.97 semantic dedup that folds sources and DELETEs the loser
+  # (consolidator.py:343-452). That is precisely the "silently picks a side on a
+  # contradiction" behaviour the ruling names. Contradiction handling stays OURS,
+  # where both rows are flagged `needs_review` and neither status changes.
+  - name: HINDSIGHT_API_ENABLE_AUTO_CONSOLIDATION
+    value: "false"
+
+  # ── Auth ────────────────────────────────────────────────────────────────────
+  # WITHOUT THIS LINE THERE IS NO AUTH. The default is DefaultTenantExtension,
+  # whose own docstring reads "No authentication required (passes all requests)"
+  # (extensions/builtin/tenant.py:8-41). A typo in this dotted path ships an open
+  # memory API that looks perfectly healthy. The boot log line
+  # `Loaded tenant extension: ApiKeyTenantExtension` is the only thing that
+  # distinguishes "loaded" from "silently defaulted" — verify it, not just a 401.
+  - name: HINDSIGHT_API_TENANT_EXTENSION
+    value: hindsight_api.extensions.builtin.tenant:ApiKeyTenantExtension
+  # HINDSIGHT_API_TENANT_API_KEY -> hindsight-secrets
+
+  # rrf (reciprocal rank fusion) — arithmetic, no model. The default `local`
+  # pulls a cross-encoder weight set into the pod.
+  - name: HINDSIGHT_API_RERANKER_PROVIDER
+    value: rrf
+
+  # ── Observability ───────────────────────────────────────────────────────────
+  - name: OTEL_EXPORTER_OTLP_ENDPOINT
+    value: http://otel-collector.observability:4318
+  - name: OTEL_SERVICE_NAME
+    value: hindsight
+
+# Its OWN Secret, not mesh-secrets. templates/deployment.yaml:79-81 consumes this
+# as `envFrom.secretRef`, which injects the ENTIRE Secret as environment — there
+# is no key subsetting. So `mesh-secrets` here would hand a third-party image
+# GH_PAT, GH_WRITE_PAT, SLACK_*, SNOWFLAKE_*, LANGFUSE_* and E2B_API_KEY, none of
+# which it uses. Substrate item #9's rule is that a write credential is never
+# ambient where it isn't needed; an ambient GH_* in a vendor pod is the exact
+# posture that rule exists to prevent. Same shape as dashboard-backend-secrets
+# and edge-backend-secrets — the convention, not an exception to it.
+#
+# Exactly seven keys, and nothing else (this count read "five" while listing six —
+# corrected here along with the addition):
+#   HINDSIGHT_API_DATABASE_URL              the `hindsight` schema owner
+#   HINDSIGHT_API_MIGRATION_DATABASE_URL    the SAME role and credential (the
+#                                           vendor reads both; they do not differ)
+#   HINDSIGHT_API_TENANT_API_KEY            the key ApiKeyTenantExtension compares
+#   HINDSIGHT_API_EMBEDDINGS_OPENAI_API_KEY a COPY of the LiteLLM gateway key
+#   HINDSIGHT_API_LLM_API_KEY               ALSO a copy of the LiteLLM gateway key
+#                                           — same gateway, separate key so the
+#                                           embeddings and synthesis paths can be
+#                                           repointed independently
+#   HINDSIGHT_CP_ACCESS_KEY                 the Control Plane console password —
+#                                           a SEPARATE key from the tenant one,
+#                                           and the human gate on port 9999
+#   HINDSIGHT_CP_DATAPLANE_API_KEY          a COPY of the tenant key: the console
+#                                           is itself an API client and 401s
+#                                           without it, even with a valid session
+#
+# ⚠ HINDSIGHT_API_LLM_API_KEY IS NOW REQUIRED, and this block previously said the
+# opposite: "NO HINDSIGHT_API_LLM_API_KEY. LLM_PROVIDER=none needs none, and the
+# key's ABSENCE is what proves the `none` path is real — do not add one just in
+# case." That reasoning was correct for `none` and is superseded by #815: with
+# LLM_PROVIDER=openai the key is mandatory at boot (two raises, cited at the LLM
+# block above), so its absence is now a crash-loop rather than a proof. The `none`
+# path is no longer the thing being evidenced — the BASE URL is, and it is
+# evidenced from the boot log, not from which keys exist.
+#
+# TWO KNOWN GAPS, recorded so neither is invisible:
+#
+# 1. Both DATABASE_URLs hold the same PASSWORD, and it is the first load-bearing
+#    DB password on transmission-recall-dev. Every existing Recall role is
+#    rds_iam-mapped — the three stored transmission/recall/dev/db/* passwords do
+#    not authenticate at all (a password login returns "PAM authentication
+#    failed"). Hindsight has no RDS IAM support (`generate_db_auth_token` appears
+#    nowhere in its source), so this is a real substrate exception, approved by
+#    Raghu 2026-08-10.
+#    THIS CREDENTIAL HAS NO ROTATION. No Recall DB secret does (`Rotation: null`
+#    on all three). Remediation on compromise is `DROP DATABASE hindsight` plus a
+#    re-backfill — which is only cheap because the separate database bounds what
+#    the credential reaches: a copy of learning bodies, no memory.* and no
+#    langgraph.*.
+# 2. The LiteLLM key now lives in THREE places across TWO Secrets — twice here
+#    (EMBEDDINGS_OPENAI_API_KEY and LLM_API_KEY) and once in mesh-secrets — so a
+#    rotation must update all three. Accepted as smaller than an ambient GitHub
+#    token in a vendor pod. Two keys rather than one shared var is the vendor's
+#    shape, not our choice: the embeddings and LLM configs are read separately.
+envFromSecret: hindsight-secrets
+
+# ⚠ BUMP THIS ON EVERY ROTATION of hindsight-secrets, in the same PR as the
+# rotation. `checksum/config` only hashes `.Values.env`; nothing hashes
+# `envFromSecret`, so rotating a key and running `helm upgrade` with
+# unchanged values renders a BYTE-IDENTICAL pod template and leaves the pod
+# on the OLD credential while `helm upgrade` exits 0. Any change to this
+# string works — it is hashed into a pod annotation, not parsed.
+secretVersion: "2026-08-12-initial"
+
+# Sized against a measured 4.2GB image running FastAPI + an in-process worker,
+# with no torch and no cross-encoder (embeddings and reranking are both remote or
+# arithmetic). Nodes allocate ~15Gi / 3920m each, so this fits alongside mesh.
+resources:
+  requests:
+    cpu: 250m
+    memory: 512Mi
+  limits:
+    cpu: "1"
+    memory: 2Gi
+
+# Default-deny ingress on 8888 AND 9999 from the namespace (the template allows
+# `service.port` plus every `service.extraPorts` entry). NOTE this is declarative
+# intent only: the cluster's aws-eks-nodeagent runs --enable-network-policy=false
+# so nothing enforces it today. It never loosens anything, and it becomes
+# load-bearing if enforcement is turned on.
+#
+# allowFromCIDRs is EMPTY, and that is now a latent gap rather than a
+# non-question: there IS an ALB in front of 9999, and with targetType=ip it dials
+# pod IPs from VPC subnets, NOT from an allowed namespace. Empty is safe TODAY
+# only because nothing enforces the policy. If CNI enforcement is turned on
+# (DS-2798) without adding the private-subnet CIDR here, the console ingress goes
+# dark. Left empty to match dashboard-backend / mesh / edge-backend, all of which
+# carry the identical debt — this should be fixed for all of them at once, in the
+# PR that enables enforcement, not divergently here.
+networkPolicy:
+  enabled: true
+  allowFromNamespaces:
+    - transmission

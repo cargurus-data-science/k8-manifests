@@ -1,0 +1,20 @@
+backend:
+  image:
+    repository: REPLACE_ME_DEV_BACKEND_ECR_REPO
+  targetGroupArn: REPLACE_ME_DEV_BACKEND_TG_ARN
+  config:
+    ENVIRONMENT: "development"
+    FRONTEND_URL: "https://turbo-dev.datasci.d-gurus.com"
+    OAUTH_GHEC_CALLBACK_URL: "https://turbo-dev.datasci.d-gurus.com/v1/auth/callback"
+    # LiteLLM + Langfuse are deferred to their own charts — fill these in once
+    # those workloads are deployed (they have no stable host yet).
+    LITELLM_BASE_URL: REPLACE_ME_LITELLM_BASE_URL
+    LANGFUSE_BASE_URL: REPLACE_ME_LANGFUSE_BASE_URL
+    LANGFUSE_HOST: REPLACE_ME_LANGFUSE_HOST
+    LANGFUSE_TRACING_ENVIRONMENT: "development"
+    REDIS_URL: REPLACE_ME_DEV_REDIS_URL         # redis://<host>:6379/2  (DB2)
+    # No QWEN_WINDOW_* in dev (prod-only, per ECS task def).
+frontend:
+  image:
+    repository: REPLACE_ME_DEV_FRONTEND_ECR_REPO
+  targetGroupArn: REPLACE_ME_DEV_FRONTEND_TG_ARN

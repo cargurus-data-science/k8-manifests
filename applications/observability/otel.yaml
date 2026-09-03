@@ -1,0 +1,159 @@
+# OpenTelemetryCollector — the collector workload reconciled by the ADOT operator.
+#
+# Applied OUT-OF-BAND with kubectl (NOT by Terraform). Terraform installs the
+# operator (aws_eks_addon "adot") + the plumbing (namespace, ServiceAccount,
+# Pod Identity association, IAM role); this CR is the pipeline the operator turns
+# into a Deployment + Service. Keeping it out of Terraform means Terraform never
+# references the OpenTelemetryCollector CRD, so plans never fail on a missing CRD.
+#
+# DUAL ROLE (DS-3149): this one collector now serves BOTH telemetry sources.
+#   1. OTLP push  — transmission app services push traces/metrics/logs to
+#      otel-collector.observability:4318 -> debug (unchanged from the migration).
+#   2. Prometheus scrape — pulls the RisingWave component /metrics and
+#      remote-writes to Amazon Managed Prometheus (AMP), SigV4-signed. See the
+#      prometheus receiver + the metrics/rw pipeline below.
+# One process = one failure domain: a crash/OOM (e.g. from high-cardinality RW
+# metrics) drops OTLP ingest too. Acceptable in dev (single replica, low volume);
+# split the scraper into its own CR before prod. First hardening if it proves
+# risky: add a memory_limiter processor ahead of batch.
+#
+# NAME: the operator names a CR's Service "<metadata.name>-collector", so
+# metadata.name "otel" yields Service "otel-collector" — resolving as
+# otel-collector.observability and preserving the fixed
+# OTEL_EXPORTER_OTLP_ENDPOINT (otel-collector.observability:4318) every service
+# emits to.
+#
+# >>> AMP TARGET — two coordinates that MUST name the same workspace:
+#   (a) HERE: the workspace id in the prometheusremotewrite endpoint below.
+#   (b) TERRAFORM: amp_workspace_arn in envs/dev/terraform.tfvars, which scopes
+#       the otel-collector role's aps:RemoteWrite. Mismatch => 403 (arn) or 404
+#       (id); a missing arn => the policy isn't created at all. The OTLP path is
+#       unaffected regardless. Dev is wired to workspace amp-dev-us-east-1. See
+#       manifests/README.md.
+apiVersion: opentelemetry.io/v1beta1
+kind: OpenTelemetryCollector
+metadata:
+  name: otel
+  namespace: observability
+spec:
+  mode: deployment
+  # Bind to the SA Terraform created + associated with Pod Identity. The AMP
+  # remote-write below authenticates as this SA's role via the default AWS
+  # credential chain (sigv4auth extension) — no keys, no annotations.
+  serviceAccount: otel-collector
+  # No image override: the operator's default is the AWS ADOT distro, which
+  # bundles the otlp + prometheus receivers, the prometheusremotewrite exporter,
+  # the sigv4auth extension, and debug. (A contrib image is only needed once the
+  # clickhouseexporter lands — a separate follow-up.)
+  config:
+    extensions:
+      # SigV4 signer for AMP remote-write. Uses the otel-collector SA's Pod
+      # Identity credentials via the default AWS credential chain.
+      sigv4auth:
+        region: us-east-1
+        service: aps
+    receivers:
+      otlp:
+        protocols:
+          grpc:
+            endpoint: 0.0.0.0:4317
+          http:
+            endpoint: 0.0.0.0:4318
+      # Scrape RisingWave component metrics via Kubernetes pod service discovery.
+      # Each RW component exposes a DIFFERENTLY-numbered port that is all named
+      # "metrics" (meta 1250, compute 1222, compactor 1260, frontend 8080), so we
+      # key off the port NAME, not a fixed number — keying off :1250 would scrape
+      # only the meta node.
+      prometheus:
+        config:
+          global:
+            scrape_interval: 30s
+            external_labels:
+              cluster: transmission-runtime-dev
+          scrape_configs:
+            - job_name: risingwave
+              kubernetes_sd_configs:
+                - role: pod
+                  namespaces:
+                    names: [risingwave]
+              relabel_configs:
+                # keep only RisingWave pods (operator label)
+                - source_labels: [__meta_kubernetes_pod_label_risingwave_name]
+                  regex: risingwave
+                  action: keep
+                # keep only the container port named "metrics" (one target/pod)
+                - source_labels: [__meta_kubernetes_pod_container_port_name]
+                  regex: metrics
+                  action: keep
+                # surface component/pod/namespace as series labels
+                - source_labels: [__meta_kubernetes_pod_label_risingwave_component]
+                  target_label: component
+                - source_labels: [__meta_kubernetes_namespace]
+                  target_label: namespace
+                - source_labels: [__meta_kubernetes_pod_name]
+                  target_label: pod
+    processors:
+      batch: {}
+    exporters:
+      debug:
+        # basic logs one summary line per batch (span/metric/log counts), not
+        # per-item resource attributes. Keeps the collector's stdout — which
+        # Fluent Bit ships to CloudWatch (/aws/containerinsights/<cluster>/
+        # application) — low-volume. Flip to `detailed` briefly to see source
+        # service.name on each item when verifying what's emitting.
+        verbosity: basic
+      # Remote-write the scraped RisingWave metrics to Amazon Managed Prometheus.
+      # Workspace id must match amp_workspace_arn in terraform.tfvars (see header).
+      prometheusremotewrite:
+        endpoint: https://aps-workspaces.us-east-1.amazonaws.com/workspaces/ws-f8acc47c-1372-4c41-b423-bc11346fa1d6/api/v1/remote_write
+        auth:
+          authenticator: sigv4auth
+    service:
+      extensions: [sigv4auth]
+      pipelines:
+        # --- transmission (OTLP push -> debug), unchanged ---
+        traces:
+          receivers: [otlp]
+          processors: [batch]
+          exporters: [debug]
+        metrics:
+          receivers: [otlp]
+          processors: [batch]
+          exporters: [debug]
+        logs:
+          receivers: [otlp]
+          processors: [batch]
+          exporters: [debug]
+        # --- RisingWave (Prometheus scrape -> AMP) ---
+        # Kept as its own pipeline so app metrics still go to debug while RW
+        # metrics go to AMP. To also ship transmission's pushed metrics to AMP,
+        # add prometheusremotewrite to the `metrics` pipeline's exporters.
+        metrics/rw:
+          receivers: [prometheus]
+          processors: [batch]
+          exporters: [prometheusremotewrite]
+---
+# Cluster-read for the collector's Prometheus Kubernetes service discovery. The
+# `role: pod` SD needs only pods; bound to the Terraform-owned otel-collector SA
+# in observability. The push-only setup needed no RBAC — the scrape receiver does.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: otel-collector-prometheus-sd
+rules:
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: otel-collector-prometheus-sd
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: otel-collector-prometheus-sd
+subjects:
+  - kind: ServiceAccount
+    name: otel-collector
+    namespace: observability

@@ -1,0 +1,162 @@
+# review-sweep (RR-B / PL-1b) — the periodic review-response detection sweep.
+#
+# A SCHEDULED BATCH job, not a service. Layered over chart/values.yaml by:
+#
+#   helm upgrade --install review-sweep chart/ \
+#     --namespace transmission \
+#     --values chart/values/review-sweep-dev.yaml \
+#     --set image.tag=<sha> --wait --atomic
+#
+# Release name = service name = values stem = `review-sweep` — the convention
+# deploy.yml's matrix follows (deploy-convention-release-name-trap). ★ This name
+# MUST also be in deploy.yml's SERVICES array (the #317 miss: without it,
+# `helm upgrade --install` never runs for the cron and the CronJob object is
+# never created in-cluster).
+#
+# `cronjob.enabled: true` flips the chart to render a `batch/v1` CronJob and
+# SUPPRESS the Deployment + Service (deployment.yaml / service.yaml gate on it).
+# It runs the SAME mesh image (so `mesh.flow.review_sweep` + scripts/ are present)
+# but as a one-shot batch container that runs the sweep and exits.
+#
+# DETECTION-ONLY (PL-1b): reads the three RR-A GitHub surfaces per pilot PR,
+# applies the zero-token watermark filter, logs "would-process", advances the
+# per-PR watermark. Invokes NO Mode and writes NOTHING to GitHub (PL-1c/1d/1e are
+# gated on core sign-off). No LLM anywhere — so no LiteLLM gateway config here
+# (unlike learning-consolidation).
+service:
+  # Resource handle (CronJob/SA/ConfigMap name). NOT a listen port — a job has no
+  # inbound traffic; `port` is unused here but the schema requires service.name.
+  name: review-sweep
+
+# Reuse the mesh image: it already carries the shared `mesh` library + scripts/
+# (Dockerfile builds from repo root), so scripts/review_sweep.py resolves and
+# `mesh.flow.review_sweep` imports. CI pins the real SHA via --set image.tag.
+image:
+  repository: 457497801237.dkr.ecr.us-east-1.amazonaws.com/transmission/mesh
+  tag: 5e172d9b
+  pullPolicy: IfNotPresent
+
+# ─────────────────────────────────────────────────────────────────────────────
+# The cron itself — every 15 min (review-response-loop-v2.md §1: the zero-token
+# watermark + free 304 polling make a tight sweep nearly free, so tight is the
+# right default; reconcile's */15 is the precedent). concurrencyPolicy=Forbid is
+# the SERIALIZE bound (§4): one sweep at a time, never two on top of each other.
+# restartPolicy=Never + backoffLimit=1: don't hammer in place; a failed pass
+# becomes a Failed Job (alertable) and the next tick retries (watermarks untouched).
+# ─────────────────────────────────────────────────────────────────────────────
+cronjob:
+  enabled: true
+  # ★ GO-LIVE GATE (PL-1i) — FLIPPED LIVE 2026-07-21. suspend=false: the */15
+  # sweep now ticks on ALL repos with an originating run (PL-1b′), engaging ONLY
+  # PRs Transmission opened (resolve_origin_run gate). It was parked (suspend=true)
+  # while the cool-off code shipped ahead of go-live; the flip is this deliberate
+  # one-line change (auditable in git — never an invisible `kubectl patch`).
+  # Pre-conditions all met before flipping:
+  #   - #442 cool-off code merged + migration 20260721000004 applied to dev-Aurora
+  #   - #445 LITELLM_BASE_URL wired (reply classifier); #447 fresh-PR anchor upsert
+  #   - live 3-window fat re-smoke PASS: batch W1 (8 accepts→1 pass, anchor armed),
+  #     W2 (trailing comments HELD, watermark not advanced = no-silent-drop),
+  #     W3 (deferred accepts re-dispatched after the window — held, not dropped).
+  # See pilot-go-live-batching-grain-question (Architect ruling) + review-loop-
+  # live-smoke-findings. To re-park: set true + helm upgrade.
+  suspend: false
+  schedule: "*/15 * * * *"       # every 15 minutes
+  timeZone: "UTC"
+  command: ["python", "scripts/review_sweep.py"]
+  concurrencyPolicy: Forbid
+  restartPolicy: Never
+  backoffLimit: 1
+  activeDeadlineSeconds: 600      # a sweep is a handful of REST lists + small UPSERTs
+
+# Pod Identity: REUSE the mesh SA — its role (transmission-dev-mesh) already holds
+# AssumeRole+TagSession+SetSourceIdentity into transmission-recall-dev-app (the RW
+# role, verified live for the conversation-mirror write path), which is exactly
+# the credential the watermark UPSERT needs. No new IAM, no new credential path —
+# the sweep reuses the mirror's RW discipline.
+serviceAccount:
+  create: false
+  name: mesh
+
+# No autoscaler / no PDB / no ingress — a batch job has none of these.
+hpa:
+  enabled: false
+ingress:
+  enabled: false
+# A CronJob has no listen port, so the default-deny *ingress* NetworkPolicy is
+# moot; skip it (egress to Recall/STS/GHES is unrestricted, same as services).
+networkPolicy:
+  enabled: false
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Config → ConfigMap. The job needs: the RW Recall path (transmission_app, IAM)
+# for the watermark UPSERT, the GitHub read config (github_api_url default is
+# GHES; GH_PAT rides the Secret), AND the LiteLLM gateway — because the sweep is
+# no longer detection-only. PL-1g wired the LIVE loop: on new human signal the
+# sweep dispatches the `reply` Mode, whose classifier calls make_model()
+# (mesh/shared/model.py) → REQUIRES LITELLM_BASE_URL + LITELLM_API_KEY. Without
+# LITELLM_BASE_URL the classifier raises "Missing required env var(s)" and every
+# comment fails → empty accept-set → the loop silently never acts (caught by the
+# PL-1i cool-off live re-smoke). Mirrors mesh-dev / learning-consolidation-dev.
+# ─────────────────────────────────────────────────────────────────────────────
+env:
+  - name: ENVIRONMENT
+    value: dev
+
+  # Observability — same collector as the services.
+  - name: OTEL_EXPORTER_OTLP_ENDPOINT
+    value: http://otel-collector.observability:4318
+  - name: OTEL_SERVICE_NAME
+    value: review-sweep
+
+  # Model gateway — the `reply` Mode's classifier (make_model → ChatOpenAI) routes
+  # through the CG LiteLLM gateway. Base URL is plain; LITELLM_API_KEY is in the
+  # mesh-secrets Secret (mounted via envFromSecret below). Same gateway as mesh-dev
+  # / learning-consolidation-dev.
+  - name: LITELLM_BASE_URL
+    value: https://litellm.datasci.d-gurus.com
+
+  # Crate (e2b) sandbox — the `address-review` Mode spins a Crate sandbox to make
+  # code edits, so the sweep needs the sandbox env just like the mesh service does
+  # (these three live in the mesh-config configmap; the cron has its own config and
+  # omitted them in the PL-1b detection-only era). Without E2B_DOMAIN the sandbox
+  # bootstrap raises "Crate sandbox requires E2B_DOMAIN" and the run fails before
+  # any tool runs (live run c92e9db9). E2B_API_KEY is in mesh-secrets (mounted via
+  # envFromSecret below) — only these three plain values are needed. Same class of
+  # gap as the LITELLM_BASE_URL miss (#445).
+  - name: E2B_DOMAIN
+    value: crate.datasci.d-gurus.com
+  - name: SANDBOX_TYPE
+    value: crate
+  - name: CRATE_SESSION_TIMEOUT_SECONDS
+    value: "2100"
+
+  # Recall RW path. The watermark UPSERT runs as transmission_app over the mirror's
+  # pool builder (mesh.mirror.db, RECALL_WRITE_ROLE). RECALL_USE_IAM=1 → the pool
+  # mints an RDS IAM token per connection; transmission-recall-dev-app
+  # `rds-db:connect`s ONLY as transmission_app (the strict role↔DB-user pairing).
+  # No DB password / secret needed under IAM.
+  - name: RECALL_USE_IAM
+    value: "true"
+  - name: RECALL_WRITE_ROLE
+    value: transmission_app
+  - name: RECALL_APP_ROLE_ARN
+    value: arn:aws:iam::457497801237:role/transmission-recall-dev-app
+
+# mesh-secrets carries everything the LIVE loop needs (same Secret the mesh
+# service uses): GH_PAT (the read-scoped GHES PAT for the three detection
+# surfaces), GH_WRITE_PAT (the service-user write PAT the comment-writer uses to
+# post replies / "done" acks + resolve threads — PL-1e, no broker for α), and
+# LITELLM_API_KEY (the gateway virtual key the reply classifier needs). NOTE: this
+# is no longer PL-1b detection-only — PL-1g dispatches the reply/address-review
+# Modes, which read + write GitHub and call the model gateway.
+envFromSecret: mesh-secrets
+
+# A sweep is very light (a few REST lists + a handful of UPSERTs — no LLM, no
+# embeddings, no sandbox).
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi

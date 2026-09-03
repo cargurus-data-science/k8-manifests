@@ -1,0 +1,19 @@
+{{- /*
+ConfigMap holds the plain (non-secret) env as data, so config is inspectable via
+`kubectl get cm <svc>-config -o yaml`. The Deployment consumes it via envFrom,
+which keeps the pod spec stable when only config values change. Only rendered
+when there is plain env to hold; secrets never land here (see envFromSecret).
+*/ -}}
+{{- if .Values.env -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "transmission.name" . }}-config
+  namespace: {{ include "transmission.namespace" . }}
+  labels:
+    {{- include "transmission.labels" . | nindent 4 }}
+data:
+  {{- range .Values.env }}
+  {{ .name }}: {{ .value | quote }}
+  {{- end }}
+{{- end }}

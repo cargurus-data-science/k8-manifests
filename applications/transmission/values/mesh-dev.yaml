@@ -1,0 +1,570 @@
+# Mesh (agent runtime) — dev environment values.
+#
+# The Mesh runtime on EKS (services/mesh/). Layered over chart/values.yaml by:
+#
+#   helm upgrade --install mesh chart/ \
+#     --namespace transmission \
+#     --values chart/values/mesh-dev.yaml \
+#     --set image.tag=<sha> --wait --atomic
+#
+# Release name = service name = values stem = `mesh` — the convention every
+# service in deploy.yml's matrix follows (`helm upgrade --install "$SERVICE"`).
+# The first hand-deploy used `transmission-mesh`; this PR renames it to `mesh`
+# (uninstall+reinstall — see PR body) so the CI matrix can manage it.
+#
+# `service.name` (mesh) is the resource handle (Deployment/Service/OTEL/ECR repo);
+# `serviceAccount.name` (mesh) is the Pod Identity binding key. They coincide for
+# mesh (unlike the dashboard, where service=dashboard-backend / SA=dashboard-be).
+service:
+  name: mesh
+  port: 8000
+
+image:
+  repository: 457497801237.dkr.ecr.us-east-1.amazonaws.com/transmission/mesh
+  # Pinned to the deployed SHA, and it must stay a real tag: `latest` has never
+  # existed in this ECR repo, so a bare `helm upgrade --values` used to render an
+  # unpullable image and land the release in ImagePullBackOff. Every deploy was
+  # silently relying on `--set image.tag=<sha>` to paper over it. The chart now
+  # FAILS at render on `latest` (`transmission.image` in _helpers.tpl) rather
+  # than producing a broken Deployment, so this value has to be maintained.
+  # ⇒ Bump it in the same commit that builds a new image.
+  # With IfNotPresent + a unique SHA tag the node pulls each new image once.
+  tag: 5e172d9b
+  pullPolicy: IfNotPresent
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Single replica — DELIBERATE, and load-bearing for the demo. Not a default.
+#
+# The agent runtime holds IN-PROCESS state: SANDBOX_PROXY caches Crate sandbox
+# handles keyed by thread_id (mesh/integrations/__init__.py), and the default
+# DeepAgentsHarness uses an in-process MemorySaver checkpointer. The triggered-
+# run fix-loop relies on "same thread_id → same SANDBOX_PROXY handle" so a CI-red
+# retry reuses the already-checked-out 12 GB DSM sandbox instead of re-cloning
+# it (triggered-run-flow.md → Demo). A second replica would land a retry on a pod
+# without that handle and re-clone — exactly what the design says not to do.
+#
+# Cross-replica reattach (thread_id↔sandbox_id via a backing store) is post-demo
+# (the SANDBOX_PROXY docstring: "lands with the agent service … when there's a
+# backing store; this PR ships the in-process half"). Until then mesh is pinned
+# to one replica: hpa.enabled=false + replicas.min=1. The PDB template auto-skips
+# for single-replica, so node drains aren't blocked. SURFACED to the Manager.
+# ─────────────────────────────────────────────────────────────────────────────
+hpa:
+  enabled: false
+replicas:
+  min: 1
+  max: 1
+
+# Pod Identity: `name` MUST match DS-2795's association for mesh —
+# (namespace=transmission, service_account=mesh) → role transmission-dev-mesh,
+# which holds the AssumeRole+TagSession+SetSourceIdentity trio into both
+# transmission-recall-dev-{app,inspector}, bedrock:InvokeModel*, and read on the
+# transmission/mesh/dev/crate-api-key secret. Verified live 2026-05-31.
+serviceAccount:
+  create: true
+  name: mesh
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Ingress — the WEBHOOK FRONT-DOOR only (PL, spec-webhook-frontdoor-build.md).
+#
+# Mesh's app-to-app traffic (trigger / gates / stream) is STILL internal-only:
+# the Okta-gated dashboard backend calls those over cluster DNS
+# (mesh.transmission.svc, see MESH_BASE_URL in dashboard-backend-dev.yaml). This
+# Ingress does NOT expose that surface — it exposes ONE path, `/api/webhooks`,
+# so GHES can deliver PR review-comment events to the receiver at
+# POST /api/webhooks/github. Everything else on this host 404s at the ALB (no
+# rule), so /api/runs/trigger etc. remain unreachable from the ALB and can only
+# be hit cluster-internally through the dashboard's Okta gate. That containment
+# is deliberate: mesh trusts trusted_forwarder (it assumes callers are the
+# Okta-gated dashboard), so exposing all of /api would let a VPN client bypass
+# the Okta gate. The webhook path is its OWN trust boundary (HMAC on X-Hub-
+# Signature-256, verified by the receiver on every delivery), so exposing just it
+# is safe.
+#
+# ROUTING CHOICE — dedicated host on the EXISTING internal ALB (option a):
+#   * host `mesh.datasci.d-gurus.com` (NEW) — a clean, collision-free front-door.
+#     mesh owns the whole host; `/api/webhooks/github` never fights dashboard-
+#     backend's `/api` ownership (which lives on turbo.datasci.d-gurus.com).
+#   * groupName `transmission-dashboard` — RIDES THE EXISTING internal ALB the
+#     dashboard already runs on (frontend + backend share it today). Reusing the
+#     PROVEN ALB inherits its GHES reachability (the whole point: it's the ALB you
+#     reach the dashboard through daily) — no new ALB, no new reachability surface.
+#     groupOrder 30 is DISTINCT from backend(10)/frontend(20) — the AWS LB
+#     Controller requires a unique order within a group. Cross-host rules don't
+#     collide (host discriminates), so order only needs to be unique here.
+#   * certificateArn — byte-IDENTICAL to the dashboard's (the shared ALB group's
+#     cert is an ALB-level annotation; a mismatch makes the controller stop
+#     reconciling the whole group — see dashboard-backend-dev.yaml). The existing
+#     `*.datasci.d-gurus.com` wildcard already covers mesh.datasci.d-gurus.com, so
+#     HTTPS works and the hook's insecure_ssl:"0" (TLS-verify) is honored.
+#   * DNS — external-dns (private zone, policy=sync) AUTO-creates the
+#     mesh.datasci.d-gurus.com A-record from the hostname annotation (see the
+#     ingress template: "No manual DNS"). Same private zone as the proven
+#     dashboard host → resolution + reachability from GHES is inherited.
+#     ★ MANAGER FLAG (post-deploy, no in-chart action possible): confirm the new
+#       A-record resolves and do ONE GHES test-delivery to mesh.datasci.d-gurus.com
+#       — the only manual verification. No manual DNS write is needed (external-dns
+#       owns the record); flag it only so the Manager confirms it landed.
+#   * path `/api/webhooks` (Prefix) — routes ONLY the webhook subtree to mesh.
+#   * healthcheckPath `/health/live` — mesh mounts health at ROOT (no /api prefix,
+#     see probes below); the ALB target-group health check (target-type=ip, dials
+#     the pod directly) must hit a real 200, which is the root health path, NOT the
+#     routed request path.
+ingress:
+  enabled: true
+  hostname: mesh.datasci.d-gurus.com
+  path: /api/webhooks
+  pathType: Prefix
+  groupName: transmission-dashboard
+  groupOrder: 30
+  healthcheckPath: /health/live
+  # MUST be byte-identical to dashboard-backend / dashboard-frontend (shared ALB
+  # group). Existing *.datasci.d-gurus.com wildcard (ISSUED, exp 2026-11-12) —
+  # covers mesh.datasci.d-gurus.com, so DS-2798 reuses it (no dedicated cert).
+  certificateArn: "arn:aws:acm:us-east-1:457497801237:certificate/4e3c9e91-1ac4-4ec2-a4f0-f007b72cd25e"
+
+# FastAPI service. Mesh mounts health at the ROOT (no /api prefix), so the
+# chart-default probe paths apply unchanged.
+probes:
+  liveness:
+    path: /health/live
+  readiness:
+    path: /health/ready
+  startup:
+    path: /health/startup
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Plain (non-secret) config → ConfigMap (inspectable via `kubectl get cm`).
+# Sensitive values live in the `mesh-secrets` Secret (envFromSecret, below).
+#
+# ENV-NAME RECONCILIATION (brief vs. code — surfaced in the PR):
+#   * The brief listed ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN. The demo Mode
+#     (SWE = DeepAgentsHarness) routes models through the CG LiteLLM gateway and
+#     reads LITELLM_BASE_URL / LITELLM_API_KEY (mesh/shared/model.py, ChatOpenAI).
+#     ANTHROPIC_* are what the ClaudeCodeHarness injects PER-SANDBOX at create
+#     time (envs=…), not service env — that's the MLE Mode, post-demo. So we wire
+#     LITELLM_*, not ANTHROPIC_*.
+#   * The brief listed CRATE_E2B_DOMAIN / CRATE_E2B_API_KEY. The Crate adapter
+#     reads E2B_DOMAIN / E2B_API_KEY (mesh/integrations/crate.py). We use those.
+# ─────────────────────────────────────────────────────────────────────────────
+env:
+  - name: ENVIRONMENT
+    value: dev
+
+  # Identity (DS-2963 / M3a) — select the verified-session provider for the
+  # dashboard-fronted deploy. This mesh runtime is called ONLY by the Okta-gated
+  # dashboard backend over cluster DNS (see the "No public Ingress" note below),
+  # which validates the user's Okta id_token (verify_okta_token) and forwards the
+  # frozen email. `trusted_forwarder` stamps that email verified=True with the
+  # documented trusted-forwarder basis (Okta-gated dashboard, cluster-internal),
+  # replacing the DevIdentityProvider's verified=False ambiguity. Unset → `dev`
+  # (the local / cg-code-configured default, unchanged). teams=[] here — team
+  # scoping is M3b (Okta groups claim + CompositeStore, IT-gated).
+  - name: IDENTITY_PROVIDER
+    value: trusted_forwarder
+
+  # --- Flip 1: team ATTRIBUTION (NOT enforcement) — Architect-ruled GO, #256 ---
+  # Per-route identity providers (the trigger route reads TRIGGER_IDENTITY_PROVIDER,
+  # the skills route reads SKILL_IDENTITY_PROVIDER; each falls back to
+  # IDENTITY_PROVIDER above, so cg-code's recall route keeps its own provider,
+  # untouched). `trusted_forwarder_teams` has the SAME trust basis as
+  # `trusted_forwarder` (Okta-gated dashboard, cluster-internal) but ALSO reads the
+  # dashboard's server-frozen, forwarded `app.showroom.*` team strings (#255) →
+  # populates Principal.teams → stamps memory.run.team_slug + fills the dashboard
+  # team column. ATTRIBUTION ONLY: enforcement is a SEPARATE axis (ROLE_PROVIDER,
+  # left unset = PermissiveRoleProvider = global-admin), so nothing is denied and
+  # no teams=[] lockout is possible here. Real enforcement is Flip 2
+  # (ROLE_PROVIDER=showroom), gated on a per-user team-coverage pre-flight (#256).
+  - name: TRIGGER_IDENTITY_PROVIDER
+    value: trusted_forwarder_teams
+  - name: SKILL_IDENTITY_PROVIDER
+    value: trusted_forwarder_teams
+  # REPO_IDENTITY_PROVIDER — the repo-registration route (#275) reads its OWN
+  # per-route provider (services/mesh/app/api/routes/repos.py); unset, it falls
+  # back to IDENTITY_PROVIDER=trusted_forwarder, which populates NO teams → the
+  # register enforce sees Principal.teams=[] → `("team", slug)` is out-of-scope →
+  # every REPO_REGISTER 403s ("resource out of principal scope") even for a real
+  # team ADMIN. Must match SKILL_/TRIGGER_ so the forwarded app.showroom.* team
+  # strings reach Principal.teams and the admin gate resolves. (Bug found live
+  # 2026-07-12: DS admin got 403 registering cg-sagemaker — this env was missing.)
+  - name: REPO_IDENTITY_PROVIDER
+    value: trusted_forwarder_teams
+  # GATES_IDENTITY_PROVIDER — the HITL approve-gate route (services/mesh/app/api/
+  # routes/gates.py) reads its OWN per-route provider; unset, it falls back to
+  # IDENTITY_PROVIDER=trusted_forwarder (teams-LESS) → Principal.teams=[] →
+  # roles_for([])=READ_ONLY → RUN_APPROVE denied → GET /api/gates 403s ("role
+  # read-only does not grant run.approve"). The operator can't even SEE the paused
+  # run, let alone approve it → every gate-paused run sticks at open_pr forever +
+  # NEEDS YOU shows "Couldn't load gates." The gates route was the ONE route left
+  # on the teams-less provider when the other three flipped (#294 P0). Must match
+  # them so the forwarded app.showroom.* strings reach Principal.teams and
+  # RUN_APPROVE resolves → /gates 200 → approve resumes the run.
+  - name: GATES_IDENTITY_PROVIDER
+    value: trusted_forwarder_teams
+  # LEARNINGS_IDENTITY_PROVIDER — the learnings-curation route (services/mesh/app/
+  # api/routes/learnings.py) reads its OWN per-route provider; unset, it falls back
+  # to IDENTITY_PROVIDER=trusted_forwarder (teams-LESS) → Principal.teams=[] →
+  # roles_for([])=READ_ONLY → LEARNING_PROMOTE/REJECT denied → the cockpit
+  # "Promote" button 502s ("mesh curation failed (403): role read-only does not
+  # grant learning.promote"). The curation route was the ONE write route left on
+  # the teams-less provider after the trigger/skill/repo/gates routes flipped —
+  # the same recurring class (#294 gates). Must match them so the forwarded
+  # app.showroom.* team strings reach Principal.teams and LEARNING_PROMOTE resolves
+  # → promote 200 → the draft enters the partial HNSW index (retrievable). (Bug
+  # found live: DS admin got 403 promoting a learning — this env was missing.)
+  - name: LEARNINGS_IDENTITY_PROVIDER
+    value: trusted_forwarder_teams
+  # HINDSIGHT_IDENTITY_PROVIDER — the retrieval-backend status route
+  # (services/mesh/app/api/routes/hindsight.py), which the dashboard's Memory
+  # console proxies to show which backend serves learnings reads, vendor health,
+  # and sync drift. Same reason as every sibling above: unset, it falls back to
+  # IDENTITY_PROVIDER=trusted_forwarder (teams-LESS) → Principal.teams=[] →
+  # roles_for([]) → 403 on a MEMORY_READ enforce(), for a DS admin included. This
+  # is the seventh instance of that bug; the route is INERT and falls back
+  # harmlessly without this line, which is why it ships in the same deploy rather
+  # than after it.
+  - name: HINDSIGHT_IDENTITY_PROVIDER
+    value: trusted_forwarder_teams
+  # MODEL_IDENTITY_PROVIDER — the model-allowlist toggle route (services/mesh/app/
+  # api/routes/models.py, #416 PM-2) reads its OWN per-route provider; unset it
+  # falls back to IDENTITY_PROVIDER=trusted_forwarder (teams-LESS) →
+  # Principal.teams=[] → roles_for([])=READ_ONLY → MANAGE_MODEL_ALLOWLIST denied →
+  # the Grid "Offerable" toggle 403s. SIXTH write route in this recurring class
+  # (gates #294/#295, repo #279, skills #296, learnings #341) — shipped without
+  # its env flip. Match the others so app.showroom.* team strings reach
+  # Principal.teams and the admin toggle 200s. (Found live: DS admin 403'd.)
+  - name: MODEL_IDENTITY_PROVIDER
+    value: trusted_forwarder_teams
+  # STOP_IDENTITY_PROVIDER — the run-stop route (services/mesh/app/api/routes/
+  # runs.py::stop_run) reads its OWN per-route provider; unset it falls back to
+  # IDENTITY_PROVIDER=trusted_forwarder (teams-LESS) → Principal.teams=[] →
+  # roles_for([])=READ_ONLY → RUN_STOP (a WRITE action) denied → the dashboard
+  # "Stop run" button 403s and hangs at "stopping…" even for a real admin. SEVENTH
+  # write route in this recurring class (gates #294/#295, repo #279, skills #296,
+  # learnings #341, models #416) — the stop route was on the base teams-less
+  # provider while its siblings flipped. Match the others so the forwarded
+  # app.showroom.* team strings reach Principal.teams and RUN_STOP resolves → stop
+  # 202 → the run finalizes 'stopped'. (Found live: DS admin 403'd stopping a run.)
+  - name: STOP_IDENTITY_PROVIDER
+    value: trusted_forwarder_teams
+  # SEMANTIC_MODEL_IDENTITY_PROVIDER — the semantic-model curation route (services/
+  # mesh/app/api/routes/semantic_models.py, the AA-3 promote/reject valve) reads its
+  # OWN per-route provider; unset it falls back to IDENTITY_PROVIDER=trusted_forwarder
+  # (teams-LESS) → Principal.teams=[] → roles_for([])=READ_ONLY → SEMANTIC_MODEL_PROMOTE/
+  # REJECT (WRITE actions) denied → the #462 "Data Context" review UI's Approve/Dismiss
+  # buttons 403. EIGHTH write route in this recurring class (gates #294/#295, repo #279,
+  # skills #296, learnings #341, models #416, stop #458) — the semantic route was on the
+  # base teams-less provider while its siblings flipped. Match the others so the forwarded
+  # app.showroom.* team strings reach Principal.teams and SEMANTIC_MODEL_PROMOTE resolves
+  # → promote 200 → the draft flips active + enters the partial HNSW index (grounds Lyra).
+  - name: SEMANTIC_MODEL_IDENTITY_PROVIDER
+    value: trusted_forwarder_teams
+  # SESSION_CLOSE_IDENTITY_PROVIDER — the Close-session route (services/mesh/app/api/
+  # routes/sessions.py::close_session, the human-close half of session-lifecycle)
+  # reads its OWN per-route provider; unset it falls back to IDENTITY_PROVIDER=
+  # trusted_forwarder (teams-LESS) → Principal.teams=[] → roles_for([])=READ_ONLY →
+  # SESSION_CLOSE (a WRITE action) denied → the dashboard "Close session" button 403s
+  # for a real admin/owner. NINTH write route in this recurring class (gates #294/#295,
+  # repo #279, skills #296, learnings #341, models #416, stop #458, semantic #462) —
+  # a new gated route MUST ship its provider env. Match the others so the forwarded
+  # app.showroom.* team strings reach Principal.teams and SESSION_CLOSE resolves →
+  # close 200 → the session records manually_closed (the compute side reads it).
+  - name: SESSION_CLOSE_IDENTITY_PROVIDER
+    value: trusted_forwarder_teams
+  # CHANNEL_IDENTITY_PROVIDER — the channel-binding route (services/mesh/app/api/
+  # routes/channels.py, contract-registered-channel.md) reads its OWN per-route
+  # provider; unset it falls back to IDENTITY_PROVIDER=trusted_forwarder
+  # (teams-LESS) → Principal.teams=[] → roles_for([])=READ_ONLY → CHANNEL_BIND (a
+  # WRITE action) denied → binding/revoking a Slack channel 403s for a real
+  # admin. TENTH write route in this recurring class (gates #294/#295, repo #279,
+  # skills #296, learnings #341, models #416, stop #458, semantic #462, session-
+  # close #553) — a new gated route MUST ship its provider env. Match the others
+  # so the forwarded app.showroom.* team strings reach Principal.teams and
+  # CHANNEL_BIND resolves → bind 200 → the channel row lands admin-scoped.
+  - name: CHANNEL_IDENTITY_PROVIDER
+    value: trusted_forwarder_teams
+  # RESCORE_IDENTITY_PROVIDER — the per-ticket Rescore route (services/mesh/app/
+  # api/routes/rescore.py, #605 Q4 — POST /api/readiness/rescore) reads its OWN
+  # per-route provider; unset it falls back to IDENTITY_PROVIDER=trusted_forwarder
+  # (teams-LESS) → Principal.teams=[] → roles_for([])=READ_ONLY → MEMORY_WRITE (a
+  # WRITE action) denied → the Queue's Rescore button 403s for a real operator.
+  # ELEVENTH write route in this recurring class (gates #294/#295, repo #279,
+  # skills #296, learnings #341, models #416, stop #458, semantic #462, session-
+  # close #553, channels #562) — a new gated route MUST ship its provider env in
+  # the SAME PR. Match the others so the forwarded app.showroom.* team strings
+  # reach Principal.teams and MEMORY_WRITE resolves → rescore 200 → the fresh
+  # verdict lands in memory.readiness_verdict.
+  - name: RESCORE_IDENTITY_PROVIDER
+    value: trusted_forwarder_teams
+  # ASK_IDENTITY_PROVIDER — the browser-chat swe-ask route (services/mesh/app/
+  # api/routes/ask_agui.py, POST /api/ask/agui) reads its OWN per-route
+  # provider; unset it falls back to IDENTITY_PROVIDER=trusted_forwarder
+  # (teams-LESS) → Principal.teams=[] → this route's owner_team resolves to
+  # None → EVERY browser caller gets the coarse UNBOUND 2-tool tier, even a
+  # real team member (fail-closed, not a 403 — there is no enforce() gate on
+  # this route to deny; the tier IS the gate, per ruling-ask-teammate-and-
+  # tiers.md #630). TWELFTH per-route provider in this recurring class (gates
+  # #294/#295, repo #279, skills #296, learnings #341, models #416, stop #458,
+  # semantic #462, session-close #553, channels #562, rescore #605) — a new
+  # gated route MUST ship its provider env in the SAME PR. Match the others so
+  # the forwarded app.showroom.* team strings reach Principal.teams and
+  # primary_team_slug() resolves a real owner_team → the bound twelve-tool
+  # tier for an actual team member.
+  - name: ASK_IDENTITY_PROVIDER
+    value: trusted_forwarder_teams
+  # CHAT_COMPLETIONS_IDENTITY_PROVIDER — the OpenAI-compatible Lyra surface
+  # (services/mesh/app/api/routes/chat_completions.py, GET /v1/models + POST
+  # /v1/chat/completions) reads its OWN per-route provider, derived by S0's
+  # `identity_provider_for("chat_completions")` (#818/#839); unset it falls back
+  # to IDENTITY_PROVIDER=trusted_forwarder. THIRTEENTH per-route provider in this
+  # recurring class (gates #294/#295, repo #279, skills #296, learnings #341,
+  # models #416, stop #458, semantic #462, session-close #553, channels #562,
+  # rescore #605, ask #630) — a new gated route MUST ship its provider env in the
+  # SAME PR. #839 added the route's authorization gate, so this is that entry.
+  #
+  # ⚠ TWO THINGS THIS DOES *NOT* DO, so the value is not over-read:
+  #  1. It does NOT populate teams here. Unlike every sibling above, the caller
+  #     is Open WebUI, not the Okta-gated dashboard, and Open WebUI forwards NO
+  #     teams-equivalent header — the route hard-codes `claimed_teams=[]`
+  #     regardless. So `trusted_forwarder_teams` and `trusted_forwarder` are
+  #     behaviourally IDENTICAL on this route today; owner_team stays None (the
+  #     fail-closed floor). It is set to `trusted_forwarder_teams` to MATCH the
+  #     convention (so the enumeration test and a future teams header find the
+  #     provider already correct), not because it currently resolves a team.
+  #  2. It is NOT the authorization gate. Authorization on this route is the
+  #     shared bearer alone (CHAT_COMPLETIONS_BEARER_TOKEN in mesh-secrets,
+  #     `_verify_bearer`, hmac.compare_digest, fails CLOSED when unset) — that
+  #     runs BEFORE this provider ever reads X-OpenWebUI-User-Email. The email
+  #     this provider stamps verified=True is ADVISORY ATTRIBUTION, trustworthy
+  #     only as "the user Open WebUI says was logged in"; nothing authorizes on
+  #     it. Ruled 2026-08-12: the bearer authenticates the CALLER, Open WebUI
+  #     itself authenticates the HUMAN; per-user Transmission Okta on this
+  #     surface is OUT OF SCOPE, not deferred.
+  - name: CHAT_COMPLETIONS_IDENTITY_PROVIDER
+    value: trusted_forwarder_teams
+
+  # --- Flip 2: team ENFORCEMENT — Architect-authorized (#256), pre-flight clean ---
+  # ROLE_PROVIDER=showroom activates ShowroomGroupRoleProvider: it parses each
+  # Principal.teams entry via parse_showroom_group into {team_slug: Role}, and
+  # `authorize` starts DENYING under-privileged / cross-team writes (RUN_TRIGGER,
+  # SKILL_IMPORT) instead of the permissive global-admin default. A Principal with
+  # no writable app.showroom.*.{admin,read-write} group → READ_ONLY (browse/read
+  # kept, write denied). Pre-flight (2026-07-12, empirical vs the real roles path):
+  # the ONLY real triggering human is rmulukutla → WRITABLE (admin); fwong/jchen
+  # are seed.sql FIXTURES (placeholder uuids, excluded); transmission-bot is the
+  # DEMO_INITIATOR_EMAIL bypass identity (not a real Okta initiator under
+  # enforcement). LOCKED column for real users = empty. Parser proven safe (bare
+  # slugs / dotless / `.assignment` drop to None, NOT admin-inflated). When the
+  # wider DS/MLPE org starts triggering, they carry app.showroom.data-science.admin
+  # (SailPoint Data-Science_Admin_SHOW, all-MLPE grant) → WRITABLE.
+  - name: ROLE_PROVIDER
+    value: showroom
+
+  # Observability — service owns the OTel provider; spans fan out to the
+  # collector in the observability namespace (verified live: otel-collector svc,
+  # :4318 OTLP-HTTP). service.name=mesh is set by the service from OTEL_SERVICE_NAME.
+  - name: OTEL_EXPORTER_OTLP_ENDPOINT
+    value: http://otel-collector.observability:4318
+  - name: OTEL_SERVICE_NAME
+    value: mesh
+  - name: LANGFUSE_HOST
+    value: https://langfuse.datasci.d-gurus.com
+
+  # Model gateway — base URL is plain; LITELLM_API_KEY is in the Secret.
+  - name: LITELLM_BASE_URL
+    value: https://litellm.datasci.d-gurus.com
+  - name: LLM_MODEL_ID
+    value: claude-sonnet-4-6
+
+  # Sandbox — Crate (default). Domain is plain; E2B_API_KEY is in the Secret.
+  - name: SANDBOX_TYPE
+    value: crate
+  - name: E2B_DOMAIN
+    value: crate.datasci.d-gurus.com
+
+  # ── Recall reads route through Hindsight (A10, adopted 2026-08-11) ─────────
+  # ON: CompositeStore's learnings reader is HindsightLearningsStore instead of
+  # RecallLearningsReader. memory.learning REMAINS the single source of truth —
+  # this changes the READ path only. Nothing writes to Hindsight on a run;
+  # `write_draft` is deliberately unimplemented there, so the draft->active
+  # curation valve still lives in our layer, above the backend.
+  #
+  # ⚠ Adopted BY RULING, not by the A/B. My measurement was a null-to-slightly-
+  # negative result and I recommended against: 5/6 top-1 agreement on six
+  # unlabelled queries over one of six namespaces, with the single disagreement
+  # favouring the incumbent — on "which tables are missing from the dbt
+  # catalogue?", where the corpus holds a learning titled exactly `Tables Not in
+  # the dbt Catalogue`; Recall ranked it #1, Hindsight #2. And `scores.final` is
+  # rank-derived, not relevance (rank 1 is always exactly 1.1000, with a constant
+  # step per rank — which is what rrf computes), so there was no numeric signal
+  # to break the tie. Raghu overruled and adopted. Recorded so the next reader
+  # knows the evidence did not drive this and can re-open it on new evidence.
+  #
+  # Requires HINDSIGHT_API_TENANT_API_KEY in mesh-secrets — build_hindsight_reader
+  # RAISES on an empty key rather than returning a reader that 401s on every
+  # call, so this flag and that key must land together.
+  #
+  # ROLLBACK is this one line back to "false" plus a rollout. The corpus itself
+  # is a COPY (A7 wrote nothing to memory.learning), so the deeper rollback is
+  # still `DROP DATABASE hindsight`.
+  - name: HINDSIGHT_LEARNINGS_READS
+    value: "true"
+
+  # ── Run cap ↔ sandbox timeout ORDERING INVARIANT (#278) ──────────────────
+  # sandbox_timeout > run_timeout — the run-level killer MUST fire before e2b
+  # reaps the sandbox. The strict run cap (RUN_TIMEOUT_S, mesh/flow/runner.py)
+  # kills + finalizes a run `timed_out` at 30 min; the Crate sandbox timeout
+  # (CRATE_SESSION_TIMEOUT_SECONDS, mesh/integrations/crate.py — code default
+  # 1800) must sit ABOVE that, or e2b reaps the sandbox at its own 30-min clock
+  # FIRST and the next sandbox touch dies with "sandbox not found: likely due to
+  # sandbox timeout" (the DS-1998 shape) instead of a clean `timed_out`. Set the
+  # sandbox timeout to 2100s (35 min) so the run-level killer always wins and the
+  # sandbox timeout is a pure backstop. Both numbers are pinned EXPLICITLY here
+  # (not left to the code default) so the invariant is legible in `kubectl get
+  # cm` and a future edit that bumps one number sees the other it must stay
+  # ordered against. Code defaults are unchanged — this is the dev override only.
+  - name: RUN_TIMEOUT_S
+    value: "1800"   # 30 min — the run-level wall-clock cap → timed_out
+  - name: CRATE_SESSION_TIMEOUT_SECONDS
+    value: "2100"   # 35 min — MUST be > RUN_TIMEOUT_S (backstop, never fires first)
+
+  # Recall — config for the outer DAG's gather_learnings READ (mesh/flow,
+  # the only Recall consumer wired today). RecallLearningsReader assumes the
+  # inspector IAM role and connects as the inspector DB user — and the two are
+  # STRICTLY PAIRED: transmission-recall-dev-inspector can `rds-db:connect` only
+  # as `transmission_inspector` (verified live). So RECALL_ROLE MUST be
+  # transmission_inspector here; setting transmission_app would assume inspector
+  # but request a token for app and the connect would be denied. Under IAM auth
+  # the token is minted per-connection (max_lifetime < 15-min TTL), so no DB
+  # password / secret is needed. FlowSettings' own defaults already match dev
+  # Aurora (host/db/inspector-ARN); we set USE_IAM + ROLE explicitly for clarity.
+  #
+  # The conversation-mirror (#50) is now ON the deployed image and WRITES
+  # run/turn/tool_call as the RW role transmission_app — a SEPARATE consumer
+  # from the inspector reader above. It reads its role from a DISTINCT env var,
+  # RECALL_WRITE_ROLE (mesh/mirror/db.py MirrorSettings), defaulting to
+  # transmission_app; we set it explicitly here, mirroring the reader's pattern,
+  # so the writer config is visible in `kubectl get cm` and not an implicit
+  # default. mesh's Pod Identity role (transmission-dev-mesh) already holds the
+  # AssumeRole+TagSession+SetSourceIdentity trio into transmission-recall-dev-app
+  # (verified live), and …-app `rds-db:connect`s only as transmission_app — the
+  # same strict role↔DB-user pairing as the inspector side.
+  - name: RECALL_USE_IAM
+    value: "true"
+  - name: RECALL_ROLE
+    value: transmission_inspector
+  - name: RECALL_WRITE_ROLE
+    value: transmission_app
+  # The durable outer-DAG checkpointer (DS-2869) is a THIRD Recall consumer with
+  # its OWN role: transmission_langgraph (langgraph schema, strict role↔DB-user
+  # pairing, its own IAM ARN). MUST be set EXPLICITLY. CheckpointerSettings binds
+  # this field with populate_by_name + case-insensitive, so WITHOUT this the field
+  # `recall_role` also matches the env var RECALL_ROLE above (=inspector) and the
+  # checkpointer tries to IAM-connect to the langgraph schema as transmission_inspector
+  # → "PAM authentication failed" → PoolTimeout → every run dies at kickoff (the
+  # 2026-07-09 outage). Setting LANGGRAPH_ROLE (its declared alias) wins over the
+  # field-name collision and restores durable runs.
+  - name: LANGGRAPH_ROLE
+    value: transmission_langgraph
+
+  # ── Lyra Snowflake EDA — the row cap (PLAIN config; the creds are in the Secret) ─
+  # The "an LLM-authored query can't pull the lake" bound. `SnowflakeEDASettings`
+  # already defaults this to 500, so setting it here is behaviour-identical TODAY —
+  # the point is that a cost/blast-radius bound should be VISIBLE and tunable in
+  # review, not an invisible library default. Enforced by capping the FETCH
+  # (`fetchmany(SNOWFLAKE_MAX_ROWS)`) in the in-sandbox runner, mirroring
+  # Edge/Turbo — NOT by rewriting the SQL with a LIMIT.
+  #
+  # ⚠ This is the LOOSER of two caps. `mesh/tools/run_sql.py` applies its own,
+  # tighter bound to what the agent-facing artifact carries; raising this value
+  # does NOT widen that one.
+  #
+  # It belongs in `env` and not in `mesh-secrets` because it is not a credential:
+  # no confidentiality value, and an operator should be able to tune it with a
+  # values change + `helm upgrade` (which DOES roll the pod, unlike a Secret-only
+  # edit) rather than by rewriting a Secret key.
+  - name: SNOWFLAKE_MAX_ROWS
+    value: "500"
+
+# Sensitive run-path creds, populated out-of-band into the `mesh-secrets` Secret
+# (stub bootstrap documented in the PR body; External Secrets productionizes it
+# post-demo). Keys injected via envFrom:
+#   - LITELLM_API_KEY      virtual key for the LiteLLM gateway
+#   - LANGFUSE_PUBLIC_KEY  pk-lf-… (paired with the secret key)
+#   - LANGFUSE_SECRET_KEY  sk-lf-…
+#   - E2B_API_KEY          Crate per-team API key
+#   - GH_PAT               READ-scoped GHES PAT — clone-in-sandbox + server-side
+#                          reads (mesh/flow). The read arm of the cred boundary.
+#   - GH_WRITE_PAT         WRITE-scoped GHES PAT — server-side push/open_pr ONLY,
+#                          held by GitHubWriter; NEVER placed in a sandbox env.
+#   - CHAT_COMPLETIONS_BEARER_TOKEN
+#                          ★ The ONLY authorization layer on the OpenAI-compatible
+#                          Lyra surface (GET /v1/models, POST /v1/chat/completions).
+#                          `_verify_bearer` hmac.compare_digest's the caller's
+#                          `Authorization: Bearer <token>` against this, BEFORE any
+#                          X-OpenWebUI-* header is read (#839). EMPTY/UNSET => the
+#                          route FAILS CLOSED (401 for every caller), never open —
+#                          so this key's presence is load-bearing, not optional.
+#                          ⚠ MUST be BYTE-IDENTICAL to openwebui-secrets'
+#                          OPENAI_API_KEY (Open WebUI's outbound bearer): the two
+#                          are the same shared service bearer, and a mismatch is a
+#                          silent, total 401 on every chat turn. Durable copy lives
+#                          in AWS Secrets Manager
+#                          `transmission/openwebui/dev/mesh-bearer-token`; rotating
+#                          it means updating SM + BOTH k8s Secrets + bumping BOTH
+#                          files' secretVersion in the same change.
+#                          ⚠ Authenticates the CALLER ("this came from our Open
+#                          WebUI"), NEVER the end user — Open WebUI authenticates
+#                          the human. Ruled 2026-08-12; not a deferred gap.
+#   - SNOWFLAKE_ACCOUNT    Lyra EDA connection identity + credential. Sourced from
+#     SNOWFLAKE_USER       AWS Secrets Manager `snowflake/transmission`, whose JSON
+#     SNOWFLAKE_ROLE       keys are already named exactly as these env vars.
+#     SNOWFLAKE_WAREHOUSE  `snowflake_eda_configured()` gates the REAL runner on
+#     SNOWFLAKE_DATABASE   user + account + (private key OR password); absent any of
+#     SNOWFLAKE_PRIVATE_KEY  them, `_NoSnowflakeEDA` returns ok=False and no sandbox
+#                          or warehouse session is ever created.
+#                          ROLE is expected to be DATA_SCIENCE_RO, but that is NOT
+#                          the safety boundary — DATA_SCIENCE_RO is a naming trap
+#                          (read+WRITE on DATA_SCIENCE_SANDBOX). The boundary is the
+#                          server-side first-token allowlist in
+#                          `mesh.core.sql_readonly`, checked BEFORE a VM exists.
+#                          ★ These reach a per-query, single-purpose Crate VM that
+#                          runs only our `_RUNNER_PY` and is deliberately NOT
+#                          registered in SANDBOX_PROXY, so no curated agent tool can
+#                          resolve it. Never add SNOWFLAKE_* to
+#                          `CrateProvisioner._read_envs()` (the AGENT's VM) — that
+#                          collapses the two VMs and voids the ruling's condition 1.
+# The two PATs are released-on-signal (the demo plan); the stub bootstrap seeds
+# placeholders so the pod starts health-first and a *run* fails loudly at the
+# GitHub node until the real values land — no silent drop.
+envFromSecret: mesh-secrets
+
+# ⚠ BUMP THIS ON EVERY ROTATION of mesh-secrets, in the same PR as the
+# rotation. `checksum/config` only hashes `.Values.env`; nothing hashes
+# `envFromSecret`, so rotating a key and running `helm upgrade` with
+# unchanged values renders a BYTE-IDENTICAL pod template and leaves the pod
+# on the OLD credential while `helm upgrade` exits 0. Any change to this
+# string works — it is hashed into a pod annotation, not parsed.
+secretVersion: "2026-08-13-chat-completions-bearer"
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 512Mi
+  limits:
+    cpu: "1"
+    memory: 1Gi
+
+# Default-deny ingress; intra-cluster callers (dashboard backend; later the SQS
+# consumer) live in `transmission`. As of the webhook front-door (above) mesh IS
+# fronted by an ALB (target-type=ip → the ALB dials pod IPs from VPC subnets, NOT
+# from an allowed namespace). Empty allowFromCIDRs is safe TODAY (the default VPC
+# CNI does not enforce NetworkPolicy — same as dashboard-backend); add the
+# VPC/private-subnet CIDR here when CNI enforcement is turned on (DS-2798), or the
+# ALB→pod webhook delivery would be dropped. Mirrors dashboard-backend-dev.yaml.
+networkPolicy:
+  enabled: true
+  allowFromNamespaces:
+    - transmission
+    - kube-system
+  allowFromCIDRs: []

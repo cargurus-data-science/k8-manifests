@@ -1,0 +1,185 @@
+# RisingWave cluster CR — reconciled by the RisingWave operator (installed
+# out-of-band via `kubectl apply` of the release manifest; see README.md).
+# Ported from the POC with three changes:
+#   (a) meta store now points at the external RDS Postgres (was an in-cluster
+#       postgresql StatefulSet — dropped);
+#   (b) every `dedicated` taint/selector renamed to `workload` for repo
+#       consistency with the Terraform-managed node group;
+#   (c) the frontend is exposed on an internal NLB directly via the CR
+#       (frontendServiceType: LoadBalancer + additionalFrontendServiceMetadata),
+#       so the operator owns the Service and its pod selector — no hand-rolled
+#       Service to keep in sync with the operator's labels.
+# State store, resources, and component shapes are unchanged from the POC; the
+# image is pinned to a specific release (the POC ran `:latest`) — see below.
+apiVersion: risingwave.risingwavelabs.com/v1alpha1
+kind: RisingWave
+metadata:
+  name: risingwave
+  namespace: risingwave
+  labels:
+    team: data-science
+spec:
+  # Pinned to a specific release (was `:latest`) so the deployed engine version
+  # is deterministic and reproducible — `:latest` silently rolls the DB engine
+  # on every operator reconcile / pod restart. Bump with intent; check the
+  # changelog before moving it. https://docs.risingwave.com/changelog/release-notes
+  image: risingwavelabs/risingwave:v3.0.3
+
+  # --- Custom TOML config (forces aws-sdk-rust S3 client for Pod Identity) ---
+  configuration:
+    configMap:
+      name: risingwave-config
+      key: risingwave.toml
+
+  # --- Meta Store: external RDS Postgres (replaces the POC's in-cluster pod) ---
+  # host is the RDS ADDRESS only (no port) — from `terraform output -raw
+  # rds_meta_endpoint` with the trailing :5432 stripped. Update it if the
+  # instance is recreated (the address changes).
+  metaStore:
+    postgresql:
+      host: transmission-dev-risingwave-meta.cz3c9nmx4mlt.us-east-1.rds.amazonaws.com
+      port: 5432
+      database: risingwave_meta
+      credentials:
+        secretName: postgresql-credentials
+        usernameKeyRef: POSTGRES_USER
+        passwordKeyRef: POSTGRES_PASSWORD
+
+  # --- State Store: S3 (Hummock) ---
+  stateStore:
+    dataDirectory: hummock
+    s3:
+      region: us-east-1
+      bucket: risingwave-hummock-state-dev
+      credentials:
+        useServiceAccount: true
+
+  # --- Frontend Service: internal NLB, provisioned by the AWS Load Balancer
+  # Controller. The operator creates and owns the frontend Service (correct pod
+  # selector guaranteed); these two fields make it a LoadBalancer and stamp the
+  # controller + external-dns annotations onto it. Postgres wire is L4/TCP, so
+  # NLB (not an ALB Ingress). Reachable from VPN / in-VPC clients at
+  # risingwave.datasci.d-gurus.com:4567 (the operator's frontend SQL port is
+  # 4567, NOT the standalone/playground default of 4566).
+  #
+  # NOTE: the operator's frontend Service also carries the metrics port (:8080)
+  # and the http port (:4560), so the internal NLB fronts those too. Acceptable
+  # in dev (internal-only, VPN).
+  # SECURITY: the endpoint is now network-reachable, so the default empty-password
+  # `root` login must be hardened — set a frontend password post-deploy
+  # (`ALTER USER root PASSWORD …`); see README.md. As defense-in-depth we also
+  # scope the frontend SG to the corporate VPN/DX CIDR. This needs TWO annotations
+  # together for an `ip`-target NLB — both learned the hard way:
+  #   * `load-balancer-source-ranges` sets the allowed CIDRs. NOTE the key has NO
+  #     `aws-` prefix (it's the lone exception); the mis-prefixed name is silently
+  #     ignored and the controller falls back to 0.0.0.0/0.
+  #   * `...-target-group-attributes: preserve_client_ip.enabled=true` — the
+  #     controller IGNORES source-ranges on an ip-target NLB unless client-IP
+  #     preservation is on, and it's off by default for ip targets. With it on,
+  #     the frontend pods see the real client IP and the controller auto-manages
+  #     the matching backend SG rules.
+  # Add the VPC CIDR to the source-ranges list if in-VPC clients also connect
+  # through the NLB rather than the in-cluster Service.
+  frontendServiceType: LoadBalancer
+  additionalFrontendServiceMetadata:
+    labels:
+      team: data-science
+    annotations:
+      service.beta.kubernetes.io/aws-load-balancer-type: external
+      service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: ip
+      service.beta.kubernetes.io/aws-load-balancer-scheme: internal
+      # Restrict inbound to the corporate VPN/DX range (comma-separated for more).
+      # Key has NO `aws-` prefix; requires preserve_client_ip below to take effect.
+      service.beta.kubernetes.io/load-balancer-source-ranges: "10.193.0.0/20"
+      service.beta.kubernetes.io/aws-load-balancer-target-group-attributes: preserve_client_ip.enabled=true
+      external-dns.alpha.kubernetes.io/hostname: risingwave.datasci.d-gurus.com
+
+  # --- Components (sized for r6i.2xlarge: 8 vCPU, 64 GB) ---
+  components:
+    # Compute (streaming) nodes
+    compute:
+      nodeGroups:
+        - name: ""
+          replicas: 1
+          template:
+            spec:
+              serviceAccountName: risingwave-s3
+              tolerations:
+                - key: workload
+                  value: risingwave
+                  effect: NoSchedule
+              nodeSelector:
+                workload: risingwave
+              resources:
+                requests:
+                  cpu: "3"
+                  memory: 16Gi
+                limits:
+                  cpu: "6"
+                  memory: 40Gi
+
+    # Compactor nodes
+    compactor:
+      nodeGroups:
+        - name: ""
+          replicas: 1
+          template:
+            spec:
+              serviceAccountName: risingwave-s3
+              tolerations:
+                - key: workload
+                  value: risingwave
+                  effect: NoSchedule
+              nodeSelector:
+                workload: risingwave
+              resources:
+                requests:
+                  cpu: "1"
+                  memory: 3Gi
+                limits:
+                  cpu: "3"
+                  memory: 8Gi
+
+    # Meta nodes: single replica (dev)
+    meta:
+      nodeGroups:
+        - name: ""
+          replicas: 1
+          template:
+            spec:
+              serviceAccountName: risingwave-s3
+              tolerations:
+                - key: workload
+                  value: risingwave
+                  effect: NoSchedule
+              nodeSelector:
+                workload: risingwave
+              resources:
+                requests:
+                  cpu: "1"
+                  memory: 3Gi
+                limits:
+                  cpu: "2"
+                  memory: 6Gi
+
+    # Frontend (serving) nodes
+    frontend:
+      nodeGroups:
+        - name: ""
+          replicas: 1
+          template:
+            spec:
+              serviceAccountName: risingwave-s3
+              tolerations:
+                - key: workload
+                  value: risingwave
+                  effect: NoSchedule
+              nodeSelector:
+                workload: risingwave
+              resources:
+                requests:
+                  cpu: "1"
+                  memory: 2Gi
+                limits:
+                  cpu: "2"
+                  memory: 4Gi

@@ -1,0 +1,103 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: turbo-app
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "turbo.labels" . | nindent 4 }}
+    {{- include "turbo.backend.selectorLabels" . | nindent 4 }}
+spec:
+  # PINNED to 1 — in-app asyncio pollers duplicate work across pods (spec §5).
+  replicas: {{ .Values.backend.replicas }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # Single replica: surge a new pod up before the old is torn down, and
+      # never voluntarily evict the only serving pod.
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      {{- include "turbo.backend.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "turbo.labels" . | nindent 8 }}
+        {{- include "turbo.backend.selectorLabels" . | nindent 8 }}
+    spec:
+      serviceAccountName: {{ .Values.backend.serviceAccountName }}
+      # Debian 'appuser' from the Dockerfile is UID 1000 (verify: docker run
+      # --rm <backend-image> id -u appuser). kubelet cannot enforce
+      # runAsNonRoot from a username, so pin the UID.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+      terminationGracePeriodSeconds: 120
+      containers:
+        - name: app
+          image: "{{ .Values.backend.image.repository }}:{{ .Values.backend.image.tag }}"
+          imagePullPolicy: {{ .Values.backend.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: 8080
+          envFrom:
+            - configMapRef:
+                name: turbo-app-config
+            - secretRef:
+                name: {{ .Values.secrets.coreName }}
+            - secretRef:
+                name: {{ .Values.secrets.externalToolsName }}
+            - secretRef:
+                name: {{ .Values.secrets.arangoName }}
+          env:
+            # envFrom cannot rename keys; the app expects these alias names.
+            - name: OMNI_BASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.externalToolsName }}
+                  key: OMNI_HOST
+            - name: OMNI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.externalToolsName }}
+                  key: OMNI_API_TOKEN
+          # Slow first boot (Langfuse/MCP preflight, embedder warmup) is
+          # absorbed by the startupProbe; liveness/readiness only take over
+          # once it passes. Readiness uses /healthz (NOT /api/v1/health/ready)
+          # so a transient DB/Redis blip can't flap the sole replica out of
+          # the ALB — ECS parity (its TG check is /healthz). See spec §4.
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            failureThreshold: 30
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          lifecycle:
+            preStop:
+              # Let the ALB deregister this pod before the app stops accepting
+              # connections (readiness gate + TG deregistration delay).
+              exec:
+                command: ["sh", "-c", "sleep 15"]
+          securityContext:
+            runAsUser: 1000
+            allowPrivilegeEscalation: false
+            # NOT read-only: the app clones repos + writes caches to the
+            # filesystem (harness prewarm, HF/embedder cache). See spec §9.3.
+            readOnlyRootFilesystem: false
+          resources:
+            {{- toYaml .Values.backend.resources | nindent 12 }}

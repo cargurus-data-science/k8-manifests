@@ -1,0 +1,36 @@
+{{- /*
+The Service fronts the long-running workload. Skipped in two cases, for the SAME
+reason — no listen port means a Service (and its empty selector targets) makes no
+sense:
+  * a scheduled-job install (`.Values.cronjob.enabled`) — a CronJob has no port;
+  * a long-lived OUTBOUND-only workload (`service.exposePort: false`) — the Slack
+    Socket Mode listener dials Slack and nothing connects to it, so a Service
+    would advertise a surface that does not exist.
+*/ -}}
+{{- if and (not .Values.cronjob.enabled) .Values.service.exposePort -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "transmission.name" . }}
+  namespace: {{ include "transmission.namespace" . }}
+  labels:
+    {{- include "transmission.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    {{- include "transmission.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.service.port }}
+      targetPort: http
+      protocol: TCP
+    {{- /* Mirrors the extra containerPorts (deployment.yaml). `targetPort` is the
+           port NAME, so the two lists cannot drift out of alignment. An Ingress
+           reaches one of these via `ingress.servicePortName`. */}}
+    {{- range .Values.service.extraPorts }}
+    - name: {{ .name }}
+      port: {{ .port }}
+      targetPort: {{ .name }}
+      protocol: TCP
+    {{- end }}
+{{- end }}

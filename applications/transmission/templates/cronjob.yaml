@@ -1,0 +1,107 @@
+{{- /*
+CronJob — a scheduled batch job (NOT a long-running service). Only rendered when
+`.Values.cronjob.enabled` is true, so the regular service installs (mesh,
+dashboard-*, edge-*) never emit one; a scheduled-job install layers a values file
+that flips it on (e.g. chart/values/learning-consolidation-dev.yaml).
+
+This is the one parameterized chart (CLAUDE.md: "Never N charts for N services"):
+the batch container reuses the same image/SA/config/secret seams as the
+Deployment path, but as a `batch/v1` CronJob — the right primitive for the M1.5
+LearningConsolidationJob (6h dedupe/supersede) and any future scheduled work
+(e.g. the learning-consolidation consolidator's sibling cron).
+
+It deliberately carries NO Service/Ingress/HPA/PDB/probes — a job that runs and
+exits has no listen port and no traffic. concurrencyPolicy=Forbid + a history
+cap keep re-runs serialized and the namespace tidy; restartPolicy=Never +
+backoffLimit make a failed pass surface as a Failed Job (alertable) rather than
+silently retrying forever.
+*/ -}}
+{{- if .Values.cronjob.enabled -}}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "transmission.name" . }}
+  namespace: {{ include "transmission.namespace" . }}
+  labels:
+    {{- include "transmission.labels" . | nindent 4 }}
+spec:
+  schedule: {{ required "cronjob.schedule is required" .Values.cronjob.schedule | quote }}
+  {{- with .Values.cronjob.timeZone }}
+  timeZone: {{ . | quote }}
+  {{- end }}
+  # suspend: DECLARATIVE go-live gate. Default false (a cron install ticks on
+  # deploy — the behavior every existing cron relies on). A values file sets it
+  # true to deploy the CronJob object PARKED (rendered, image current, but the
+  # scheduler skips it) so code can ship ahead of go-live; flipping it to false
+  # (the review-sweep all-repos flip) is then a deliberate, auditable helm change
+  # rather than an out-of-band `kubectl patch` that helm can't see and the next
+  # `helm upgrade` would silently revert.
+  suspend: {{ .Values.cronjob.suspend | default false }}
+  # Forbid overlapping runs: a slow pass must not have a second one start on top
+  # of it (the supersede UPDATE is idempotent, but serialized is cleaner).
+  concurrencyPolicy: {{ .Values.cronjob.concurrencyPolicy }}
+  startingDeadlineSeconds: {{ .Values.cronjob.startingDeadlineSeconds }}
+  successfulJobsHistoryLimit: {{ .Values.cronjob.successfulJobsHistoryLimit }}
+  failedJobsHistoryLimit: {{ .Values.cronjob.failedJobsHistoryLimit }}
+  jobTemplate:
+    spec:
+      backoffLimit: {{ .Values.cronjob.backoffLimit }}
+      {{- with .Values.cronjob.activeDeadlineSeconds }}
+      activeDeadlineSeconds: {{ . }}
+      {{- end }}
+      template:
+        metadata:
+          labels:
+            {{- include "transmission.labels" . | nindent 12 }}
+            {{- with .Values.podLabels }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- with .Values.podAnnotations }}
+          annotations:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+        spec:
+          serviceAccountName: {{ include "transmission.serviceAccountName" . }}
+          # A batch pass: run to completion, do not restart in place. A failed
+          # run becomes a Failed Job (alertable); it never touches a live agent run.
+          restartPolicy: {{ .Values.cronjob.restartPolicy }}
+          {{- with .Values.podSecurityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          containers:
+            - name: {{ include "transmission.name" . }}
+              image: "{{ include "transmission.image" . }}"
+              imagePullPolicy: {{ .Values.image.pullPolicy }}
+              command:
+                {{- toYaml .Values.cronjob.command | nindent 16 }}
+              {{- if or .Values.env .Values.envFromSecret }}
+              envFrom:
+                {{- if .Values.env }}
+                - configMapRef:
+                    name: {{ include "transmission.name" . }}-config
+                {{- end }}
+                {{- if .Values.envFromSecret }}
+                - secretRef:
+                    name: {{ .Values.envFromSecret }}
+                {{- end }}
+              {{- end }}
+              resources:
+                {{- toYaml .Values.resources | nindent 16 }}
+              {{- with .Values.containerSecurityContext }}
+              securityContext:
+                {{- toYaml . | nindent 16 }}
+              {{- end }}
+          {{- with .Values.nodeSelector }}
+          nodeSelector:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.affinity }}
+          affinity:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.tolerations }}
+          tolerations:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+{{- end }}

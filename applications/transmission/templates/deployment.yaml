@@ -1,0 +1,156 @@
+{{- /*
+The long-running workload. Skipped for a scheduled-job install
+(`.Values.cronjob.enabled`), which ships a `batch/v1` CronJob (cronjob.yaml)
+instead of a Deployment+Service — a job that runs and exits has no listen port.
+*/ -}}
+{{- if not .Values.cronjob.enabled -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "transmission.name" . }}
+  namespace: {{ include "transmission.namespace" . }}
+  labels:
+    {{- include "transmission.labels" . | nindent 4 }}
+spec:
+  {{- /* When the HPA owns replica count, omit `replicas` so Helm upgrades don't
+         fight the autoscaler (reset-to-min on every deploy). */}}
+  {{- if not .Values.hpa.enabled }}
+  replicas: {{ .Values.replicas.min }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "transmission.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "transmission.labels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- if or .Values.env .Values.secretVersion .Values.podAnnotations }}
+      annotations:
+        {{- /* Roll pods when plain config changes, even if the pod spec is
+               otherwise identical (envFrom doesn't trigger a rollout on its own). */}}
+        {{- if .Values.env }}
+        checksum/config: {{ .Values.env | toYaml | sha256sum }}
+        {{- end }}
+        {{- /* The Secret half of the same problem. `envFrom.secretRef` values are
+               read at pod start and the Secret is managed out of band, so Helm
+               cannot hash its contents — a rotated key with unchanged values
+               renders a byte-identical pod template, skips the roll, and leaves
+               the pod on the OLD credential while `helm upgrade` exits 0.
+               `secretVersion` is an operator-set rotation marker; changing it
+               changes this annotation and forces the roll. See values.yaml for
+               why this is not a `lookup`, and note `rollout restart` remains the
+               unconditional backstop. */}}
+        {{- if .Values.secretVersion }}
+        checksum/secret-version: {{ .Values.secretVersion | sha256sum }}
+        {{- end }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "transmission.serviceAccountName" . }}
+      {{- with .Values.terminationGracePeriodSeconds }}
+      terminationGracePeriodSeconds: {{ . }}
+      {{- end }}
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: {{ include "transmission.name" . }}
+          image: "{{ include "transmission.image" . }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- /* Optional entrypoint override — mirrors `cronjob.command`. A
+              long-lived NON-SERVER workload (the Slack Socket Mode listener,
+              `scripts/standup_socket.py`) reuses the mesh image but must NOT run
+              its CMD (`fastapi run`). Unset → the image's own CMD, byte-identical
+              to every existing service. */}}
+          {{- with .Values.command }}
+          command:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- /* A listen port is opt-out: an OUTBOUND-only workload (the socket
+              listener dials Slack; nothing connects TO it) has no port to
+              advertise, and declaring one would imply a service surface it
+              doesn't have. Default true → unchanged for every service. */}}
+          {{- if .Values.service.exposePort }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.service.port }}
+              protocol: TCP
+            {{- /* Additional listen ports for a workload whose image starts more
+                than one server — the Hindsight vendor image runs its API on 8888
+                and a separate Next.js console on 9999 in ONE process tree, so a
+                second Helm release cannot address it (the Service selector pins
+                `app.kubernetes.io/instance: <release>`, so a second release
+                either duplicates the pod or selects nothing). Empty default →
+                renders nothing. */}}
+            {{- range .Values.service.extraPorts }}
+            - name: {{ .name }}
+              containerPort: {{ .port }}
+              protocol: TCP
+            {{- end }}
+          {{- end }}
+          {{- if or .Values.env .Values.envFromSecret }}
+          envFrom:
+            {{- if .Values.env }}
+            - configMapRef:
+                name: {{ include "transmission.name" . }}-config
+            {{- end }}
+            {{- if .Values.envFromSecret }}
+            - secretRef:
+                name: {{ .Values.envFromSecret }}
+            {{- end }}
+          {{- end }}
+          {{- if .Values.probes.liveness.enabled }}
+          livenessProbe:
+            httpGet:
+              path: {{ .Values.probes.liveness.path }}
+              port: http
+            initialDelaySeconds: {{ .Values.probes.liveness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.liveness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.liveness.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.liveness.failureThreshold }}
+          {{- end }}
+          {{- if .Values.probes.readiness.enabled }}
+          readinessProbe:
+            httpGet:
+              path: {{ .Values.probes.readiness.path }}
+              port: http
+            initialDelaySeconds: {{ .Values.probes.readiness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.readiness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.readiness.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.readiness.failureThreshold }}
+          {{- end }}
+          {{- if .Values.probes.startup.enabled }}
+          startupProbe:
+            httpGet:
+              path: {{ .Values.probes.startup.path }}
+              port: http
+            initialDelaySeconds: {{ .Values.probes.startup.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.startup.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.startup.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.startup.failureThreshold }}
+          {{- end }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          {{- with .Values.containerSecurityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

@@ -1,0 +1,169 @@
+# Dashboard backend — dev environment values.
+#
+# Layered over chart/values.yaml by:
+#   helm upgrade --install dashboard-backend chart/ \
+#     --values chart/values/dashboard-backend-dev.yaml
+#
+# Identity split (intentional): `service.name` is the resource handle used
+# everywhere (Deployment/Service/Ingress/OTEL/ECR repo); `serviceAccount.name`
+# is the SHORT name DS-2795's EKS Pod Identity association binds on. They differ
+# on purpose — see chart/README.md "Pod Identity wiring".
+service:
+  name: dashboard-backend
+  port: 8000
+
+image:
+  repository: 457497801237.dkr.ecr.us-east-1.amazonaws.com/transmission/dashboard-backend
+  tag: 0590738a
+  pullPolicy: IfNotPresent
+
+replicas:
+  min: 1
+  max: 2
+
+# Pod Identity (NOT IRSA): no role-arn annotation. `name` MUST equal the
+# service_account in DS-2795's aws_eks_pod_identity_association for the backend.
+serviceAccount:
+  create: true
+  name: dashboard-be
+
+# Shares one ALB with the frontend (same hostname) via ingress.groupName.
+# Backend owns the /api prefix; lower groupOrder => its rule is matched before
+# the frontend's catch-all "/".
+ingress:
+  enabled: true
+  hostname: turbo.datasci.d-gurus.com
+  path: /api
+  groupName: transmission-dashboard
+  groupOrder: 10
+  # ALB (target-type=ip) health-checks pods directly; the API mounts health
+  # under /api, so a bare "/" would 404 and mark every target unhealthy.
+  healthcheckPath: /api/health/live
+  # Existing *.datasci.d-gurus.com wildcard (ISSUED, exp 2026-11-12) — covers
+  # this host, so DS-2798 reuses it rather than minting a dedicated cert. MUST
+  # be byte-identical to the frontend's (shared ALB group: cert-arn is an
+  # ALB-level annotation; a mismatch makes the LB controller stop reconciling).
+  certificateArn: "arn:aws:acm:us-east-1:457497801237:certificate/4e3c9e91-1ac4-4ec2-a4f0-f007b72cd25e"
+
+# Probes hit the container on :8000. Routes are mounted under /api
+# (settings.API_V1_STR), so health lives at /api/health/{live,ready,startup}.
+probes:
+  liveness:
+    path: /api/health/live
+  readiness:
+    path: /api/health/ready
+  startup:
+    path: /api/health/startup
+
+env:
+  - name: ENVIRONMENT
+    value: dev
+  - name: PROJECT_NAME
+    value: dashboard
+  - name: FRONTEND_HOST
+    value: https://turbo.datasci.d-gurus.com
+  - name: BACKEND_CORS_ORIGINS
+    value: https://turbo.datasci.d-gurus.com
+  - name: RECALL_HOST
+    value: transmission-recall-dev.cluster-cz3c9nmx4mlt.us-east-1.rds.amazonaws.com
+  - name: RECALL_PORT
+    value: "5432"
+  - name: RECALL_DATABASE
+    value: transmission_recall
+  - name: RECALL_ROLE
+    value: transmission_inspector
+  # On-cluster we mint an RDS IAM auth token per connection via the
+  # dashboard-be Pod Identity role (assumes transmission-recall-dev-inspector,
+  # DS-2795 association + recall@98b11ff trust). Without this the pool defaults
+  # to RECALL_LOCAL_URL (127.0.0.1:5433) and every /api query fails.
+  - name: RECALL_USE_IAM
+    value: "true"
+  # The dashboard backend is the demo's trust boundary: the paste-spec form +
+  # stop button POST here (Okta-stamped user_email), and this forwards to mesh
+  # on the cluster-internal address. Without this the proxy defaults to
+  # localhost:8000 (config.py) and trigger/stream/stop POST to the backend
+  # itself. `mesh` is the ClusterIP service (chart release = service name).
+  - name: MESH_BASE_URL
+    value: http://mesh.transmission.svc.cluster.local:8000
+  # Okta is now live for the dev deploy (DS-2942 / ITSYS-3052): IT fixed the
+  # Transmission Okta app's redirect URIs to cover this host, so the real
+  # /auth/login→callback→verify_okta_token flow works. The deployed dashboard
+  # requires a real Okta login. As of DS-2964 this flag is INERT on dev:
+  # config.py re-locked auth_bypass_active to ENVIRONMENT=="local" only, so a
+  # dev deploy can never bypass regardless of this value. The flag is KEPT (and
+  # left false, defensively) because config.py still honors it for local
+  # `just dashboard-be` and the test suite (ENVIRONMENT=local).
+  - name: AUTH_BYPASS_FOR_LOCAL
+    value: "false"
+  - name: OKTA_DOMAIN
+    value: cargurus.okta.com
+  - name: OKTA_REDIRECT_URI
+    value: https://turbo.datasci.d-gurus.com/api/auth/callback
+  # Okta audience for id_token validation. The callback verifies the OIDC
+  # `id_token` (auth.py), whose `aud` claim is the CLIENT_ID — NOT the org
+  # AS audience `api://default` (that's an access_token's aud). So the audience
+  # here must be the client-id. verify_okta_token (security.py) already falls
+  # back to OKTA_CLIENT_ID when OKTA_AUDIENCE is unset, so we leave it UNSET and
+  # rely on that fallback. (Setting api://default here caused "Invalid audience"
+  # against the id_token — DS-2942 live-smoke, 2026-07-01.)
+  - name: OTEL_EXPORTER_OTLP_ENDPOINT
+    value: http://otel-collector.observability:4318
+  - name: OTEL_SERVICE_NAME
+    value: dashboard-backend
+  # The Grid page (GET /api/models) reads the LiteLLM model catalog server-side
+  # (the browser can't reach LiteLLM: VPC-internal + key-gated). BASE_URL is a
+  # plain value; the read-scoped virtual key rides the secret below
+  # (LITELLM_MODELS_KEY) — NEVER hardcoded here. Until platform mints + delivers
+  # that key, GET /api/models degrades gracefully (empty catalog, stale:true) —
+  # the Grid shows "unavailable", the app boots fine.
+  - name: LITELLM_BASE_URL
+    value: https://litellm.datasci.d-gurus.com
+  # The Crate pane (GET /api/sandboxes/*) reads the e2b template catalog +
+  # active-sandboxes list server-side (the browser can't reach e2b directly).
+  # Domain is plain, same posture/value as mesh-dev.yaml's SANDBOX config;
+  # E2B_API_KEY rides the secret below — NEVER hardcoded here. Until platform
+  # mints + delivers that key, the route degrades gracefully (status:
+  # "unconfigured") — the pane shows "Crate not configured", the app boots fine.
+  - name: E2B_DOMAIN
+    value: crate.datasci.d-gurus.com
+
+# Pulled from AWS Secrets Manager via External Secrets:
+#   - DASHBOARD_JWT_SECRET
+#   - OKTA_CLIENT_ID
+#   - OKTA_CLIENT_SECRET
+#   - RECALL_PASSWORD
+#   - LITELLM_MODELS_KEY  (read-scoped LiteLLM virtual key for the Grid catalog
+#     read — DEPENDENCY: platform must mint this and add it to the
+#     dashboard-backend-secrets SecretStore; the Grid shows "unavailable" until
+#     then, and the graceful-degrade path means the app boots without it.)
+#   - E2B_API_KEY  (read-scoped e2b API key for the Crate pane's template +
+#     active-sandbox reads — DEPENDENCY: platform must mint this and add it to
+#     the dashboard-backend-secrets SecretStore; the pane shows "not configured"
+#     until then, and the graceful-degrade path means the app boots without it.)
+envFromSecret: dashboard-backend-secrets
+
+# ⚠ BUMP THIS ON EVERY ROTATION of dashboard-backend-secrets, in the same PR
+# as the rotation. `checksum/config` only hashes `.Values.env`; nothing
+# hashes `envFromSecret`, so rotating a key and running `helm upgrade` with
+# unchanged values renders a BYTE-IDENTICAL pod template and leaves the pod
+# on the OLD credential while `helm upgrade` exits 0. Any change to this
+# string works — it is hashed into a pod annotation, not parsed.
+secretVersion: "2026-08-12-initial"
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+networkPolicy:
+  enabled: true
+  allowFromNamespaces:
+    - transmission
+    - kube-system
+  # Add the VPC/private-subnet CIDR here when CNI NetworkPolicy enforcement is
+  # turned on (DS-2798), so the ALB (target-type=ip) can reach pods. Empty is
+  # safe today: the default VPC CNI does not enforce NetworkPolicy.
+  allowFromCIDRs: []
