@@ -65,7 +65,6 @@ kubectl apply -f applications/observability/otel.yaml
 helm lint ./applications/<app> -f applications/<app>/values-<env>.yaml
 helm template <release> ./applications/<app> -n <namespace> -f applications/<app>/values-<env>.yaml \
   | kubeconform -ignore-missing-schemas -strict -summary
-helm unittest ./applications/<app>            # where a tests/ dir exists (e.g. turbo)
 
 # Kustomize
 kustomize build applications/risingwave/ | kubeconform -ignore-missing-schemas -strict -summary

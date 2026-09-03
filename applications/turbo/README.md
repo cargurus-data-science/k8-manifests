@@ -30,7 +30,7 @@ references them by name and never templates a Secret value.
    ```
 
 3. **Pod Identity associations exist** (Terraform) for ServiceAccounts
-   `turbo-app` (S3 media + Bedrock) and `turbo-frontend` (no AWS access).
+   `turbo` (S3 media + Bedrock) and `turbo-frontend` (no AWS access).
 
 ## Install / upgrade
 
@@ -83,7 +83,6 @@ ever wanted, is a `argocd.argoproj.io/sync-wave` annotation added at that time.
 ```bash
 helm lint ./applications/turbo -f applications/turbo/values-prod.yaml
 helm lint ./applications/turbo -f applications/turbo/values-dev.yaml
-helm unittest ./applications/turbo
 helm template turbo ./applications/turbo -n turbo -f applications/turbo/values-prod.yaml <…--set images/arns…> \
   | kubeconform -ignore-missing-schemas -strict -summary
 ```
