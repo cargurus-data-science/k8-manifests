@@ -88,9 +88,10 @@ spec:
       service.beta.kubernetes.io/aws-load-balancer-type: external
       service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: ip
       service.beta.kubernetes.io/aws-load-balancer-scheme: internal
-      # Restrict inbound to the corporate VPN/DX range (comma-separated for more).
+      # Restrict inbound to the corporate VPN/DX range + the P2F SageMaker endpoint
+      # subnets (comma-separated). Must be CIDRs — there is no source-SG annotation.
       # Key has NO `aws-` prefix; requires preserve_client_ip below to take effect.
-      service.beta.kubernetes.io/load-balancer-source-ranges: "10.193.0.0/20"
+      service.beta.kubernetes.io/load-balancer-source-ranges: "10.193.0.0/20,10.251.68.0/24,10.251.69.0/24,10.251.70.0/24"
       service.beta.kubernetes.io/aws-load-balancer-target-group-attributes: preserve_client_ip.enabled=true
       external-dns.alpha.kubernetes.io/hostname: risingwave.datasci.d-gurus.com
 
