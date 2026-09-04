@@ -22,7 +22,7 @@ references them by name and never templates a Secret value.
    pod fails `CreateContainerConfigError`:
    | Secret | Source bundle |
    |---|---|
-   | `turbo-core` | `turbo/core-prod` (ns `turbo`) or `turbo/core-dev` (ns `turbo-dev`) |
+   | `turbo-core` | `turbo/core` (same name in both envs — distinct AWS accounts) |
    | `turbo-external-tools` | `turbo/external-tools` |
    | `turbo-arango` | `turbo/arango` |
    ```bash
@@ -60,6 +60,43 @@ recovers once the backend is ready — no crash loop. The backend's only
 ordering constraints are internal (Secrets + Pod Identity present, DB
 migrations run). Apply the whole chart in one release; Kubernetes converges.
 For a manual first bootstrap, backend-first is natural but optional.
+
+## Secret availability & ordering
+
+A pod that references a missing Secret does **not** hard-fail — it sits in
+`CreateContainerConfigError` and the kubelet **retries automatically**, so the
+app converges once the Secret appears. That native retry is the backstop under
+both the current model and a future ESO one; the chart itself enforces no
+secret ordering.
+
+**Today (out-of-band Secrets).** The three Secrets in Prerequisites must exist
+*before* `helm upgrade`. If you install first, the backend simply loops in
+`CreateContainerConfigError` until you apply them — no data risk, just a stalled
+rollout.
+
+**Future (External Secrets Operator).** The chart already carries `SecretStore`
++ `ExternalSecret` CRs (`templates/externalsecrets.yaml`) behind
+`.Values.externalSecrets.enabled` (default off); flipping it on makes ESO the
+source of the three Secrets instead of out-of-band creation. The ESO *operator*
+stays a cluster-wide platform addon — never in this chart. ESO reconciles
+**asynchronously**, so Helm apply-order alone can't guarantee the Secret exists
+when pods start, and Helm's default kind-sort actually applies `ExternalSecret`
+*after* `Deployment`. Two ways to order it:
+
+- **Default — native retry.** Apply everything together; pods self-heal within
+  seconds once ESO syncs. Simplest, and the operator is already running
+  cluster-wide. Recommended unless a real problem appears.
+- **Hard gate (only if needed).** `helm.sh/hook: pre-install,pre-upgrade` +
+  `hook-weight` on the `SecretStore` (`-10`) and `ExternalSecret` (`-5`), plus a
+  weight-`0` wait Job running `kubectl wait --for=condition=Ready
+  externalsecret/<name>`. Helm blocks on Job hooks, so the Deployment isn't
+  applied until the Secrets are `Ready`. Costs: RBAC for the Job's
+  ServiceAccount, and hook resources are awkward in `helm diff` / `get manifest`.
+
+Ordering only covers **first install** (Secret absent). It does nothing for
+**value rotation** on a running deployment — the pod is already up with stale
+env. That needs Stakater Reloader (restart pods when Secret content changes) and
+is tracked separately.
 
 ## Backend is pinned to one replica
 

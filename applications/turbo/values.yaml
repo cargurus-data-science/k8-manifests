@@ -6,6 +6,22 @@ secrets:
   externalToolsName: turbo-external-tools
   arangoName: turbo-arango
 
+# External Secrets Operator (opt-in; default off). When enabled, ESO syncs the
+# AWS Secrets Manager bundles into the three Secrets above, so they no longer
+# need out-of-band creation. The ESO *operator* is a cluster-wide platform addon
+# (NOT in this chart) — these are just the tenant CRs. Auth is the ESO
+# controller's own role (scoped to turbo/* on the addon side); no per-tenant
+# role is wired here. refreshInterval is omitted → ESO's 1h default (harmless;
+# pods only pick up changes on restart, which is Reloader's job, not wired yet).
+externalSecrets:
+  enabled: false
+  region: us-east-1
+  secretStoreName: turbo-aws
+  remoteKeys:
+    core: turbo/core                      # same bundle name in both envs (distinct accounts)
+    externalTools: turbo/external-tools
+    arango: turbo/arango
+
 backend:
   replicas: 1                              # PINNED — do not raise (spec §5)
   image:
