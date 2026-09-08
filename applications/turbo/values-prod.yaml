@@ -1,0 +1,24 @@
+backend:
+  image:
+    repository: REPLACE_ME_PROD_BACKEND_ECR_REPO
+  targetGroupArn: REPLACE_ME_PROD_BACKEND_TG_ARN
+  config:
+    ENVIRONMENT: "production"
+    FRONTEND_URL: "https://turbo.datasci.d-gurus.com"
+    OAUTH_GHEC_CALLBACK_URL: "https://turbo.datasci.d-gurus.com/v1/auth/callback"
+    # LiteLLM + Langfuse are deferred to their own charts — fill these in once
+    # those workloads are deployed (they have no stable host yet).
+    LITELLM_BASE_URL: REPLACE_ME_LITELLM_BASE_URL
+    LANGFUSE_BASE_URL: REPLACE_ME_LANGFUSE_BASE_URL
+    LANGFUSE_HOST: REPLACE_ME_LANGFUSE_HOST
+    LANGFUSE_TRACING_ENVIRONMENT: "production"
+    REDIS_URL: REPLACE_ME_PROD_REDIS_URL        # redis://<host>:6379   (DB0)
+    # prod-only qwen serving window (locals.tf: cron 05:00 / 20:00 ET)
+    QWEN_WINDOW_START_ET: "05:00"
+    QWEN_WINDOW_STOP_ET: "20:00"
+    QWEN_WINDOW_WARMUP_MIN: "15"
+    QWEN_WINDOW_DRAIN_MIN: "10"
+frontend:
+  image:
+    repository: REPLACE_ME_PROD_FRONTEND_ECR_REPO
+  targetGroupArn: REPLACE_ME_PROD_FRONTEND_TG_ARN

@@ -61,8 +61,6 @@ ordering constraints are internal (Secrets + Pod Identity present, DB
 migrations run). Apply the whole chart in one release; Kubernetes converges.
 For a manual first bootstrap, backend-first is natural but optional.
 
-## Secret availability & ordering
-
 A pod that references a missing Secret does **not** hard-fail — it sits in
 `CreateContainerConfigError` and the kubelet **retries automatically**, so the
 app converges once the Secret appears. That native retry is the backstop under
