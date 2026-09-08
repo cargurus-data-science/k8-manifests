@@ -106,6 +106,15 @@ spec:
       # Workspace id must match amp_workspace_arn in terraform.tfvars (see header).
       prometheusremotewrite:
         endpoint: https://aps-workspaces.us-east-1.amazonaws.com/workspaces/ws-f8acc47c-1372-4c41-b423-bc11346fa1d6/api/v1/remote_write
+        # Preserve RisingWave's native Prometheus metric names end-to-end. This
+        # exporter defaults add_metric_suffixes=true, which re-appends OTel
+        # type/unit suffixes (_total, _bytes, _seconds, _ratio) on export. The
+        # prometheus receiver already ingests RW's names verbatim
+        # (trim_metric_suffixes defaults false), so a scraped counter rw_x_total
+        # lands in AMP mangled (e.g. rw_x_total_total) — and RW's stock Grafana
+        # dashboards, built for a native scrape, then miss it. false = write the
+        # names exactly as scraped.
+        add_metric_suffixes: false
         auth:
           authenticator: sigv4auth
     service:
