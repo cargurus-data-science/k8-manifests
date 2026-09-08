@@ -53,14 +53,26 @@ backend:
     ARANGO_DATABASE: "turbo"
     ARANGO_URL: ""                          # empty → backend skips ArangoDB gracefully
     MEDIA_S3_BUCKET: REPLACE_ME_MEDIA_BUCKET  # modules/s3 output
-    # workflow-runner vars — ECS-specific, non-functional on EKS (spec §9.1).
-    # Carried so the app boots; workflow execution stays broken until the
-    # ecs:RunTask launcher is ported to the K8s Jobs API (out of scope).
-    ECS_CLUSTER_NAME: "turbo"
-    ECS_WORKFLOW_RUNNER_TASK_DEF: ""
-    ECS_WORKFLOW_RUNNER_CONTAINER_NAME: ""
-    ECS_WORKFLOW_RUNNER_SUBNETS: ""
-    ECS_WORKFLOW_RUNNER_SECURITY_GROUP: ""
+
+# Runtime env for the workflow-runner Job (ConfigMap turbo-workflow-runner-config),
+# read by the `turbo workflow run` CLI the backend launches via EKSDispatchService.
+# The EKS analog of the ECS runner task-def's `environment` block
+# (terraform/workflow_runner.tf), minus vars the runner never reads (no HTTP, no
+# OAuth, no repo prewarm). Secret bundles + the two OMNI aliases reach the Job via
+# envFrom, wired imperatively in EKSDispatchService — not here. Env-specific values
+# (ENVIRONMENT, URLs, PROMPT_LABEL, REDIS DB) live in values-{env}.yaml.
+workflowRunner:
+  config:
+    AI_MODEL: "turbo-sonnet"
+    EMBEDDING_MODEL: "turbo-embed"
+    EMBEDDING_DIM: "1024"
+    GITHUB_REQUIRED_ORG: "cargurus-analytics"
+    GITHUB_ADMIN_LOGINS: '["rmankad","jhmorgan-cg"]'
+    OKTA_ADMIN_EMAILS: '["rmankad@cargurus.com","jhmorgan@cargurus.com"]'
+    GHES_API_BASE_URL: "https://code.cargurus.com/api/v3"
+    MEDIA_S3_BUCKET: REPLACE_ME_MEDIA_BUCKET  # modules/s3 output (same bucket as backend)
+    ARANGO_DATABASE: "turbo"                  # inert unless ARANGO_URL is set
+    ARANGO_URL: ""                            # KG workflows only; empty → skipped
 
 frontend:
   replicas: 1

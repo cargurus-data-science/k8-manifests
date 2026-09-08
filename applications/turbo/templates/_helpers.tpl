@@ -17,3 +17,9 @@ app.kubernetes.io/component: backend
 app.kubernetes.io/name: turbo
 app.kubernetes.io/component: frontend
 {{- end -}}
+
+{{/* Matches the pod labels EKSDispatchService stamps on each runner Job. */}}
+{{- define "turbo.workflowRunner.selectorLabels" -}}
+app.kubernetes.io/name: turbo
+app.kubernetes.io/component: workflow-runner
+{{- end -}}
