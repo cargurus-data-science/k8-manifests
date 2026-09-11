@@ -33,7 +33,7 @@ spec:
         fsGroup: 1001
       containers:
         - name: frontend
-          image: "{{ .Values.frontend.image.repository }}:{{ .Values.frontend.image.tag }}"
+          image: "{{ required "frontend.image.repository must be set in values-<env>.yaml" .Values.frontend.image.repository }}:{{ required "frontend.image.tag must be set (values-<env>.yaml or --set at deploy)" .Values.frontend.image.tag }}"
           imagePullPolicy: {{ .Values.frontend.image.pullPolicy }}
           ports:
             - name: http

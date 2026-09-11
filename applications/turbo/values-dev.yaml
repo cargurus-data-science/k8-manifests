@@ -1,6 +1,7 @@
 backend:
   image:
     repository: REPLACE_ME_DEV_BACKEND_ECR_REPO
+    tag: REPLACE_ME_DEV_IMAGE_SHA             # immutable SHA; --set …tag=<sha> at deploy overrides
   targetGroupArn: REPLACE_ME_DEV_BACKEND_TG_ARN
   config:
     ENVIRONMENT: "development"
@@ -28,4 +29,5 @@ workflowRunner:
 frontend:
   image:
     repository: REPLACE_ME_DEV_FRONTEND_ECR_REPO
+    tag: REPLACE_ME_DEV_IMAGE_SHA
   targetGroupArn: REPLACE_ME_DEV_FRONTEND_TG_ARN

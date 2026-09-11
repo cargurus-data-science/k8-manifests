@@ -15,6 +15,10 @@ data:
   # values-{env}.yaml (per-env). Secret bundles (turbo-core / -external-tools /
   # -arango) and the two OMNI alias secretKeyRefs are attached to the Job
   # imperatively by EKSDispatchService, NOT here.
+  # Env common to backend + workflow-runner (single source of truth in values).
+  {{- range $k, $v := .Values.sharedConfig }}
+  {{ $k }}: {{ $v | quote }}
+  {{- end }}
   {{- range $k, $v := .Values.workflowRunner.config }}
   {{ $k }}: {{ $v | quote }}
   {{- end }}

@@ -6,6 +6,26 @@ secrets:
   externalToolsName: turbo-external-tools
   arangoName: turbo-arango
 
+# Non-secret env common to BOTH the backend and the workflow-runner, rendered
+# into each component's ConfigMap. Single source of truth for identity/infra
+# values that MUST stay in sync across the two (org, admin allow-lists, GHES
+# host, Arango, media bucket) — drift here is a correctness/authorization bug.
+# NOT rendered into the frontend ConfigMap (frontend ranges only over
+# frontend.config). Per-env overrides may add/replace keys via a sharedConfig
+# block in values-{env}.yaml. Keys here must be truly common to both components;
+# anything only one side reads belongs in that component's own config block.
+sharedConfig:
+  GITHUB_REQUIRED_ORG: "cargurus-analytics"
+  GITHUB_ADMIN_LOGINS: '["rmankad","jhmorgan-cg"]'
+  OKTA_ADMIN_EMAILS: '["rmankad@cargurus.com","jhmorgan@cargurus.com"]'
+  GHES_API_BASE_URL: "https://code.cargurus.com/api/v3"
+  ARANGO_DATABASE: "turbo"                  # inert unless ARANGO_URL is set
+  # empty → both components skip ArangoDB gracefully. The real per-env URL (which
+  # carries credentials) is supplied by the turbo-arango secret bundle via
+  # envFrom.secretRef, which overrides this "" default. See externalsecrets.yaml.
+  ARANGO_URL: ""
+  MEDIA_S3_BUCKET: REPLACE_ME_MEDIA_BUCKET  # modules/s3 output
+
 # External Secrets Operator (opt-in; default off). When enabled, ESO syncs the
 # AWS Secrets Manager bundles into the three Secrets above, so they no longer
 # need out-of-band creation. The ESO *operator* is a cluster-wide platform addon
@@ -25,10 +45,13 @@ externalSecrets:
 backend:
   replicas: 1                              # PINNED — do not raise (spec §5)
   image:
-    repository: REPLACE_ME_BACKEND_ECR_REPO   # modules/ecr (prod: turbo, dev: turbo-dev)
-    tag: REPLACE_ME_IMAGE_SHA                 # immutable SHA per deploy
+    # repository + tag have NO shared default — both are per-env and live only in
+    # values-<env>.yaml (repository differs prod:turbo / dev:turbo-dev; tag is the
+    # immutable per-deploy SHA, also settable via --set at deploy). Templates
+    # `required` both, so a missing overlay fails at `helm template` instead of
+    # silently applying one env's image everywhere (drift/wrong-image risk).
     pullPolicy: IfNotPresent
-  targetGroupArn: REPLACE_ME_BACKEND_TG_ARN   # modules/alb output
+  # targetGroupArn is per-env (modules/alb output) → values-<env>.yaml (required).
   serviceAccountName: turbo
   resources:
     requests:
@@ -36,23 +59,18 @@ backend:
       memory: 4Gi
       ephemeral-storage: 20Gi               # repo clones + caches (spec §9.3, tunable)
     limits:
+      cpu: "2"                              # == request → Guaranteed QoS + ECS Fargate parity (task cpu 2048)
       memory: 4Gi
       ephemeral-storage: 40Gi
-  # Non-secret env → ConfigMap turbo-app-config. Env-specific values are
-  # overridden/added in values-{env}.yaml.
+  # Backend-only non-secret env → ConfigMap turbo-app-config. Env-specific values
+  # are overridden/added in values-{env}.yaml. Keys common to the workflow-runner
+  # live in the top-level sharedConfig block (rendered into both ConfigMaps).
   config:
     OAUTH_GHEC_ENABLED: "true"
     OKTA_ISSUER: "https://cargurus.okta.com/oauth2/default"
     TURBO_ASSISTANTS_DIR: "/app/assistants"
-    GHES_API_BASE_URL: "https://code.cargurus.com/api/v3"
-    GITHUB_REQUIRED_ORG: "cargurus-analytics"
-    GITHUB_ADMIN_LOGINS: '["rmankad","jhmorgan-cg"]'
-    OKTA_ADMIN_EMAILS: '["rmankad@cargurus.com","jhmorgan@cargurus.com"]'
     DBT_CLOUD_IP_ALLOWLIST: "52.3.77.232,3.214.191.130,34.233.79.135"
-    HARNESS_PREWARM_REPOS: '["https://github.com/cargurus-analytics/dbt-central","https://github.com/cargurus-analytics/dbt-secure","https://github.com/cargurus-analytics/dbt-mrr","https://github.com/cargurus-analytics/dbt-fivetran-transformations","https://github.com/cargurus-analytics/dbt-iceberg","https://github.com/cargurus-analytics/cg-omni-curated","https://github.com/cargurus-analytics/cg-omni-restricted","https://github.com/cargurus-analytics/turbo","https://code.cargurus.com/analytics/migrator_analytics","https://code.cargurus.com/analytics/analytics-semantic-layer","https://github.com/cargurus-analytics/dbt-iceberg"]'
-    ARANGO_DATABASE: "turbo"
-    ARANGO_URL: ""                          # empty → backend skips ArangoDB gracefully
-    MEDIA_S3_BUCKET: REPLACE_ME_MEDIA_BUCKET  # modules/s3 output
+    HARNESS_PREWARM_REPOS: '["https://github.com/cargurus-analytics/dbt-central","https://github.com/cargurus-analytics/dbt-secure","https://github.com/cargurus-analytics/dbt-mrr","https://github.com/cargurus-analytics/dbt-fivetran-transformations","https://github.com/cargurus-analytics/dbt-iceberg","https://github.com/cargurus-analytics/cg-omni-curated","https://github.com/cargurus-analytics/cg-omni-restricted","https://github.com/cargurus-analytics/turbo","https://code.cargurus.com/analytics/migrator_analytics","https://code.cargurus.com/analytics/analytics-semantic-layer","https://code.cargurus.com/cargurus-eng/cg-looker-curated"]'
 
 # Runtime env for the workflow-runner Job (ConfigMap turbo-workflow-runner-config),
 # read by the `turbo workflow run` CLI the backend launches via EKSDispatchService.
@@ -62,30 +80,26 @@ backend:
 # envFrom, wired imperatively in EKSDispatchService — not here. Env-specific values
 # (ENVIRONMENT, URLs, PROMPT_LABEL, REDIS DB) live in values-{env}.yaml.
 workflowRunner:
+  # Workflow-runner-only non-secret env. Keys common to the backend live in the
+  # top-level sharedConfig block (rendered into both ConfigMaps).
   config:
     AI_MODEL: "turbo-sonnet"
     EMBEDDING_MODEL: "turbo-embed"
     EMBEDDING_DIM: "1024"
-    GITHUB_REQUIRED_ORG: "cargurus-analytics"
-    GITHUB_ADMIN_LOGINS: '["rmankad","jhmorgan-cg"]'
-    OKTA_ADMIN_EMAILS: '["rmankad@cargurus.com","jhmorgan@cargurus.com"]'
-    GHES_API_BASE_URL: "https://code.cargurus.com/api/v3"
-    MEDIA_S3_BUCKET: REPLACE_ME_MEDIA_BUCKET  # modules/s3 output (same bucket as backend)
-    ARANGO_DATABASE: "turbo"                  # inert unless ARANGO_URL is set
-    ARANGO_URL: ""                            # KG workflows only; empty → skipped
 
 frontend:
   replicas: 1
   image:
-    repository: REPLACE_ME_FRONTEND_ECR_REPO  # prod: turbo-frontend, dev: turbo-frontend-dev
-    tag: REPLACE_ME_IMAGE_SHA
+    # repository + tag are per-env → values-<env>.yaml only; templates `required`
+    # both (see backend note above).
     pullPolicy: IfNotPresent
-  targetGroupArn: REPLACE_ME_FRONTEND_TG_ARN
+  # targetGroupArn is per-env → values-<env>.yaml (required).
   serviceAccountName: turbo-frontend
   resources:
     requests:
       cpu: 250m
       memory: 512Mi
     limits:
+      cpu: 250m                              # == request → Guaranteed QoS
       memory: 512Mi
   config: {}                                # BACKEND_URL is templated (in-cluster DNS)
