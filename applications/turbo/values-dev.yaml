@@ -1,6 +1,7 @@
 backend:
   image:
     repository: REPLACE_ME_DEV_BACKEND_ECR_REPO
+    tag: REPLACE_ME_DEV_IMAGE_SHA             # immutable SHA; --set …tag=<sha> at deploy overrides
   targetGroupArn: REPLACE_ME_DEV_BACKEND_TG_ARN
   config:
     ENVIRONMENT: "development"
@@ -8,13 +9,25 @@ backend:
     OAUTH_GHEC_CALLBACK_URL: "https://turbo-dev.datasci.d-gurus.com/v1/auth/callback"
     # LiteLLM + Langfuse are deferred to their own charts — fill these in once
     # those workloads are deployed (they have no stable host yet).
-    LITELLM_BASE_URL: REPLACE_ME_LITELLM_BASE_URL
-    LANGFUSE_BASE_URL: REPLACE_ME_LANGFUSE_BASE_URL
-    LANGFUSE_HOST: REPLACE_ME_LANGFUSE_HOST
+    LITELLM_URL: REPLACE_ME_LITELLM_URL         # app reads LITELLM_URL (config.py); NOT *_BASE_URL
+    LANGFUSE_HOST: REPLACE_ME_LANGFUSE_HOST     # canonical; LANGFUSE_BASE_URL alias not needed
     LANGFUSE_TRACING_ENVIRONMENT: "development"
     REDIS_URL: REPLACE_ME_DEV_REDIS_URL         # redis://<host>:6379/2  (DB2)
     # No QWEN_WINDOW_* in dev (prod-only, per ECS task def).
+workflowRunner:
+  # Dev overrides, deep-merged onto values.yaml workflowRunner.config.
+  config:
+    ENVIRONMENT: "development"
+    FRONTEND_URL: "https://turbo-dev.datasci.d-gurus.com"
+    # Same LiteLLM/Langfuse endpoints as the backend; filled once those charts deploy.
+    LITELLM_URL: REPLACE_ME_LITELLM_URL
+    LANGFUSE_HOST: REPLACE_ME_LANGFUSE_HOST
+    LANGFUSE_TRACING_ENVIRONMENT: "development"
+    PROMPT_LABEL: "latest"
+    REDIS_URL: REPLACE_ME_DEV_REDIS_URL         # redis://<host>:6379/2  (DB2)
+    # No QWEN_WINDOW_* in dev (config.py defaults apply; wire real values at prod).
 frontend:
   image:
     repository: REPLACE_ME_DEV_FRONTEND_ECR_REPO
+    tag: REPLACE_ME_DEV_IMAGE_SHA
   targetGroupArn: REPLACE_ME_DEV_FRONTEND_TG_ARN

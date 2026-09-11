@@ -107,6 +107,7 @@ order. Re-running is safe (idempotent); if anything raced, re-apply. Editing
 `additionalFrontendServiceMetadata` recreates the frontend Service, replacing the
 NLB (new hostname, new managed SG id) with ~1 min of downtime.
 
+
 The CR's `metaStore.postgresql.host` is the dev RDS **address** (host only, no
 port). If the RDS instance is ever recreated, refresh it — the address changes:
 

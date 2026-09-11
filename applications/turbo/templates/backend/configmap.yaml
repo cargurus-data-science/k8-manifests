@@ -10,6 +10,22 @@ data:
   # PORT must equal the container port or uvicorn defaults to 8000 and the
   # ALB health check (/healthz on :8080) never passes. See Global Constraints.
   PORT: "8080"
+  # Workflow-runner dispatch. The backend launches each run as a K8s Job
+  # (EKSDispatchService) that reuses this same image running the
+  # `turbo workflow run` CLI, in this namespace. The runner's own runtime env
+  # lives in the separate turbo-workflow-runner-config ConfigMap. Sizing/TTL
+  # knobs (EKS_WORKFLOW_RUNNER_CPU/…/TTL_SECONDS) are omitted — config.py
+  # defaults give ECS Fargate parity.
+  # Hardcoded "eks": this chart only ever deploys to EKS. config.py defaults to
+  # "ecs" (the rollback path, which never runs under Helm), so the app needs this
+  # set explicitly for get_workflow_dispatcher() to pick EKSDispatchService.
+  WORKFLOW_DISPATCH_BACKEND: "eks"
+  EKS_WORKFLOW_RUNNER_IMAGE: "{{ required "backend.image.repository must be set in values-<env>.yaml" .Values.backend.image.repository }}:{{ required "backend.image.tag must be set (values-<env>.yaml or --set at deploy)" .Values.backend.image.tag }}"
+  EKS_WORKFLOW_RUNNER_NAMESPACE: {{ .Release.Namespace | quote }}
+  # Env common to backend + workflow-runner (single source of truth in values).
+  {{- range $k, $v := .Values.sharedConfig }}
+  {{ $k }}: {{ $v | quote }}
+  {{- end }}
   {{- range $k, $v := .Values.backend.config }}
   {{ $k }}: {{ $v | quote }}
   {{- end }}

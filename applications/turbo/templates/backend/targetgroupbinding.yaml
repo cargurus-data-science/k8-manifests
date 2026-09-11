@@ -13,4 +13,4 @@ spec:
   serviceRef:
     name: turbo-app
     port: 8080
-  targetGroupARN: {{ .Values.backend.targetGroupArn }}
+  targetGroupARN: {{ required "backend.targetGroupArn must be set in values-<env>.yaml" .Values.backend.targetGroupArn }}

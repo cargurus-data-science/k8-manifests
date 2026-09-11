@@ -1,0 +1,24 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: turbo-workflow-runner-config
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "turbo.labels" . | nindent 4 }}
+    {{- include "turbo.workflowRunner.selectorLabels" . | nindent 4 }}
+data:
+  # Non-secret runtime env for the workflow-runner Job. The backend launches
+  # each run as a one-shot K8s Job (EKSDispatchService) that envFrom-loads this
+  # ConfigMap. DEDICATED (not turbo-app-config): the runner serves no HTTP, does
+  # no OAuth, and doesn't prewarm repos, so its env genuinely differs from the
+  # API's. Populated from .Values.workflowRunner.config (common) +
+  # values-{env}.yaml (per-env). Secret bundles (turbo-core / -external-tools /
+  # -arango) and the two OMNI alias secretKeyRefs are attached to the Job
+  # imperatively by EKSDispatchService, NOT here.
+  # Env common to backend + workflow-runner (single source of truth in values).
+  {{- range $k, $v := .Values.sharedConfig }}
+  {{ $k }}: {{ $v | quote }}
+  {{- end }}
+  {{- range $k, $v := .Values.workflowRunner.config }}
+  {{ $k }}: {{ $v | quote }}
+  {{- end }}
