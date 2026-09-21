@@ -36,7 +36,7 @@ spec:
       terminationGracePeriodSeconds: 120
       containers:
         - name: app
-          image: "{{ .Values.backend.image.repository }}:{{ .Values.backend.image.tag }}"
+          image: "{{ required "backend.image.repository must be set in values-<env>.yaml" .Values.backend.image.repository }}:{{ required "backend.image.tag must be set (values-<env>.yaml or --set at deploy)" .Values.backend.image.tag }}"
           imagePullPolicy: {{ .Values.backend.image.pullPolicy }}
           ports:
             - name: http

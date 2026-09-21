@@ -20,8 +20,12 @@ data:
   # "ecs" (the rollback path, which never runs under Helm), so the app needs this
   # set explicitly for get_workflow_dispatcher() to pick EKSDispatchService.
   WORKFLOW_DISPATCH_BACKEND: "eks"
-  EKS_WORKFLOW_RUNNER_IMAGE: "{{ .Values.backend.image.repository }}:{{ .Values.backend.image.tag }}"
+  EKS_WORKFLOW_RUNNER_IMAGE: "{{ required "backend.image.repository must be set in values-<env>.yaml" .Values.backend.image.repository }}:{{ required "backend.image.tag must be set (values-<env>.yaml or --set at deploy)" .Values.backend.image.tag }}"
   EKS_WORKFLOW_RUNNER_NAMESPACE: {{ .Release.Namespace | quote }}
+  # Env common to backend + workflow-runner (single source of truth in values).
+  {{- range $k, $v := .Values.sharedConfig }}
+  {{ $k }}: {{ $v | quote }}
+  {{- end }}
   {{- range $k, $v := .Values.backend.config }}
   {{ $k }}: {{ $v | quote }}
   {{- end }}
