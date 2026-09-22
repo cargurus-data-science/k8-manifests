@@ -1,18 +1,21 @@
+externalSecrets:
+  enabled: true
+
 backend:
   image:
-    repository: REPLACE_ME_DEV_BACKEND_ECR_REPO
-    tag: REPLACE_ME_DEV_IMAGE_SHA             # immutable SHA; --set …tag=<sha> at deploy overrides
-  targetGroupArn: REPLACE_ME_DEV_BACKEND_TG_ARN
+    repository: 457497801237.dkr.ecr.us-east-1.amazonaws.com/turbo/backend
+    tag: v0.1.0
+  targetGroupArn: "arn:aws:elasticloadbalancing:us-east-1:457497801237:targetgroup/turbo-dev-backend/c530de46a0cb54a4"
   config:
     ENVIRONMENT: "development"
     FRONTEND_URL: "https://turbo-dev.datasci.d-gurus.com"
-    OAUTH_GHEC_CALLBACK_URL: "https://turbo-dev.datasci.d-gurus.com/v1/auth/callback"
+    OAUTH_GHEC_CALLBACK_URL: "https://turbo-dev.datasci.d-gurus.com/api/v1/auth/okta/callback"
     # LiteLLM + Langfuse are deferred to their own charts — fill these in once
     # those workloads are deployed (they have no stable host yet).
     LITELLM_URL: REPLACE_ME_LITELLM_URL         # app reads LITELLM_URL (config.py); NOT *_BASE_URL
     LANGFUSE_HOST: REPLACE_ME_LANGFUSE_HOST     # canonical; LANGFUSE_BASE_URL alias not needed
     LANGFUSE_TRACING_ENVIRONMENT: "development"
-    REDIS_URL: REPLACE_ME_DEV_REDIS_URL         # redis://<host>:6379/2  (DB2)
+    REDIS_URL: "redis://turbo-dev-redis.gj2lv9.ng.0001.use1.cache.amazonaws.com:6379/2"
     # No QWEN_WINDOW_* in dev (prod-only, per ECS task def).
 workflowRunner:
   # Dev overrides, deep-merged onto values.yaml workflowRunner.config.
@@ -24,10 +27,10 @@ workflowRunner:
     LANGFUSE_HOST: REPLACE_ME_LANGFUSE_HOST
     LANGFUSE_TRACING_ENVIRONMENT: "development"
     PROMPT_LABEL: "latest"
-    REDIS_URL: REPLACE_ME_DEV_REDIS_URL         # redis://<host>:6379/2  (DB2)
+    REDIS_URL: "redis://turbo-dev-redis.gj2lv9.ng.0001.use1.cache.amazonaws.com:6379/2"
     # No QWEN_WINDOW_* in dev (config.py defaults apply; wire real values at prod).
 frontend:
   image:
-    repository: REPLACE_ME_DEV_FRONTEND_ECR_REPO
-    tag: REPLACE_ME_DEV_IMAGE_SHA
-  targetGroupArn: REPLACE_ME_DEV_FRONTEND_TG_ARN
+    repository: 457497801237.dkr.ecr.us-east-1.amazonaws.com/turbo/frontend
+    tag: v0.1.0
+  targetGroupArn: "arn:aws:elasticloadbalancing:us-east-1:457497801237:targetgroup/turbo-dev-frontend/540c10a99896ba85"
